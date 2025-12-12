@@ -28,3 +28,15 @@ export function search(q: string, cityId?: string, limit = 20): Promise<SearchRe
   if (cityId) params.set("city_id", cityId);
   return getJson(`${BASE}/search?${params.toString()}`);
 }
+
+export function trending(cityId?: string, limit = 10): Promise<{ city_id: string | null; items: any[] }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cityId) params.set("city_id", cityId);
+  return getJson(`${BASE}/search/trending?${params.toString()}`);
+}
+
+export function trending(cityId?: string, limit = 10): Promise<{ city_id: string | null; items: any[] }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cityId) params.set("city_id", cityId);
+  return getJson(`${BASE}/search/trending?${params.toString()}`);
+}

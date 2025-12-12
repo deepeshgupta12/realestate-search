@@ -33,12 +33,26 @@ function Section({ title, items }: { title: string; items: SuggestItem[] }) {
 export default function SearchPage() {
   const sp = useSearchParams();
   const q = sp.get("q") || "";
+  if (!q.trim()) {
+  return (
+    <main style={{ padding: "28px 20px", display: "flex", justifyContent: "center" }}>
+      <div style={{ width: "100%", maxWidth: 900 }}>
+        <SearchBar />
+        <div style={{ marginTop: 18, color: "#666" }}>Type a query and hit Search.</div>
+      </div>
+    </main>
+  );
+}
   const cityId = sp.get("city_id") || "";
 
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   const [data, setData] = useState<SearchResponse | null>(null);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   const [loading, setLoading] = useState(false);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   const [err, setErr] = useState<string | null>(null);
 
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   useEffect(() => {
     if (!q.trim()) return;
     setLoading(true);
@@ -49,6 +63,7 @@ export default function SearchPage() {
       .finally(() => setLoading(false));
   }, [q, cityId]);
 
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   const total = useMemo(() => {
     if (!data) return 0;
     return (

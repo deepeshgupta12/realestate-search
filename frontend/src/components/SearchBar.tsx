@@ -2,11 +2,12 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { resolve, suggest } from "@/lib/api";
+import { resolve, suggest, trending } from "@/lib/api";
 import type { SuggestItem, SuggestResponse } from "@/lib/types";
 
 type Props = {
   initialQuery?: string;
+  initialCityId?: string;
 };
 
 const CITY_OPTIONS = [
@@ -14,6 +15,8 @@ const CITY_OPTIONS = [
   { label: "Pune", value: "city_pune" },
   { label: "Noida", value: "city_noida" },
 ];
+
+type RecentItem = { q: string; cityId: string; ts: number };
 
 function flattenGroups(r: SuggestResponse | null): SuggestItem[] {
   if (!r) return [];
@@ -35,27 +38,66 @@ function groupLabel(entityType: string): string {
   return "Other";
 }
 
-export default function SearchBar({ initialQuery }: Props) {
+const LS_KEY = "re_search_recent_v1";
+
+function loadRecents(): RecentItem[] {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed as RecentItem[];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecent(item: RecentItem) {
+  const recents = loadRecents();
+  const next = [
+    item,
+    ...recents.filter((r) => !(r.q.toLowerCase() === item.q.toLowerCase() && r.cityId === item.cityId)),
+  ].slice(0, 8);
+  localStorage.setItem(LS_KEY, JSON.stringify(next));
+}
+
+export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const router = useRouter();
   const [q, setQ] = useState(initialQuery || "");
-  const [cityId, setCityId] = useState("");
+  const [cityId, setCityId] = useState(initialCityId || "");
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState<SuggestResponse | null>(null);
   const [open, setOpen] = useState(false);
   const [activeIdx, setActiveIdx] = useState(-1);
   const [error, setError] = useState<string | null>(null);
 
+  const [trend, setTrend] = useState<any[]>([]);
+  const [recents, setRecents] = useState<RecentItem[]>([]);
+
   const lastReq = useRef(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const items = useMemo(() => flattenGroups(resp), [resp]);
+  const hasAnySuggestions = items.length > 0 || Boolean(resp?.did_you_mean);
+
+  // Load recents once
+  useEffect(() => {
+    setRecents(typeof window !== "undefined" ? loadRecents() : []);
+  }, []);
+
+  // Fetch trending (city-scoped) when dropdown opens or city changes
+  useEffect(() => {
+    if (!open) return;
+    trending(cityId || undefined, 10)
+      .then((r) => setTrend(r.items || []))
+      .catch(() => setTrend([]));
+  }, [open, cityId]);
 
   // Debounced suggest
   useEffect(() => {
     const query = q.trim();
     if (query.length < 1) {
       setResp(null);
-      setOpen(false);
       setActiveIdx(-1);
       return;
     }
@@ -76,7 +118,6 @@ export default function SearchBar({ initialQuery }: Props) {
           if (reqId !== lastReq.current) return;
           setError(e.message || "Suggest failed");
           setResp(null);
-          setOpen(false);
         })
         .finally(() => {
           if (reqId !== lastReq.current) return;
@@ -97,18 +138,15 @@ export default function SearchBar({ initialQuery }: Props) {
     try {
       const r = await resolve(queryTrim, cityId || undefined);
 
+      // persist recents
+      saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
+      setRecents(loadRecents());
+
       if (r.action === "redirect") {
-        // Demo "redirect" page in our local app
         router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(queryTrim)}`);
         return;
       }
 
-      if (r.action === "disambiguate") {
-        router.push(`/search?q=${encodeURIComponent(queryTrim)}&city_id=${encodeURIComponent(cityId)}`);
-        return;
-      }
-
-      // serp
       const params = new URLSearchParams({ q: queryTrim });
       if (cityId) params.set("city_id", cityId);
       router.push(`/search?${params.toString()}`);
@@ -121,7 +159,7 @@ export default function SearchBar({ initialQuery }: Props) {
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (!open || items.length === 0) {
+    if (!open) {
       if (e.key === "Enter") submit(q);
       return;
     }
@@ -142,11 +180,13 @@ export default function SearchBar({ initialQuery }: Props) {
     }
   }
 
-  function pick(item: SuggestItem) {
+  function pick(item: { name: string }) {
     setQ(item.name);
     setOpen(false);
     submit(item.name);
   }
+
+  const showNoResultsWhileTyping = q.trim().length > 0 && !hasAnySuggestions;
 
   return (
     <div style={{ maxWidth: 760, width: "100%", position: "relative" }}>
@@ -154,7 +194,13 @@ export default function SearchBar({ initialQuery }: Props) {
         <select
           value={cityId}
           onChange={(e) => setCityId(e.target.value)}
-          style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
+          style={{
+            padding: "10px 12px",
+            borderRadius: 8,
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: "rgba(255,255,255,0.04)",
+            color: "inherit",
+          }}
         >
           {CITY_OPTIONS.map((c) => (
             <option key={c.value} value={c.value}>
@@ -168,13 +214,15 @@ export default function SearchBar({ initialQuery }: Props) {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={onKeyDown}
-          onFocus={() => q.trim() && setOpen(true)}
+          onFocus={() => setOpen(true)}
           placeholder="Search city, locality, project, builder, rates, properties…"
           style={{
             flex: 1,
             padding: "10px 12px",
             borderRadius: 8,
-            border: "1px solid #ddd",
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: "rgba(255,255,255,0.04)",
+            color: "inherit",
             outline: "none",
           }}
         />
@@ -184,9 +232,9 @@ export default function SearchBar({ initialQuery }: Props) {
           style={{
             padding: "10px 14px",
             borderRadius: 8,
-            border: "1px solid #222",
-            background: "#222",
-            color: "white",
+            border: "1px solid rgba(255,255,255,0.25)",
+            background: "rgba(255,255,255,0.10)",
+            color: "inherit",
             cursor: "pointer",
           }}
         >
@@ -194,62 +242,141 @@ export default function SearchBar({ initialQuery }: Props) {
         </button>
       </div>
 
-      {error ? (
-        <div style={{ marginTop: 8, color: "crimson", fontSize: 14 }}>{error}</div>
-      ) : null}
+      {error ? <div style={{ marginTop: 8, color: "crimson", fontSize: 14 }}>{error}</div> : null}
 
-      {open && (resp?.did_you_mean || items.length > 0) ? (
+      {open ? (
         <div
           style={{
             position: "absolute",
             top: 46,
             left: 0,
             right: 0,
-            border: "1px solid #e5e5e5",
+            border: "1px solid rgba(255,255,255,0.18)",
             borderRadius: 10,
-            background: "white",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+            background: "rgba(20,20,24,0.98)",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
             overflow: "hidden",
             zIndex: 50,
           }}
         >
-          {resp?.did_you_mean ? (
-            <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", fontSize: 14 }}>
-              Did you mean{" "}
-              <button
-                onClick={() => submit(resp.did_you_mean!)}
-                style={{ border: "none", background: "transparent", color: "#0b57d0", cursor: "pointer" }}
-              >
-                {resp.did_you_mean}
-              </button>
-              ?
-            </div>
-          ) : null}
+          {/* Empty query: show Recents + Trending */}
+          {q.trim().length === 0 ? (
+            <div>
+              {recents.length > 0 ? (
+                <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)" }}>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Recent searches</div>
+                  {recents.map((r) => (
+                    <div
+                      key={`${r.q}-${r.cityId}-${r.ts}`}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => pick({ name: r.q })}
+                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                    >
+                      <div style={{ fontSize: 14, fontWeight: 600 }}>{r.q}</div>
+                      <div style={{ fontSize: 12, opacity: 0.7 }}>{r.cityId ? `City: ${r.cityId}` : "All Cities"}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
 
-          {items.length === 0 ? (
-            <div style={{ padding: "12px", fontSize: 14, color: "#666" }}>No suggestions</div>
+              <div style={{ padding: "10px 12px" }}>
+                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
+                {trend.length === 0 ? (
+                  <div style={{ fontSize: 14, opacity: 0.7 }}>No trending items</div>
+                ) : (
+                  trend.slice(0, 8).map((t: any) => (
+                    <div
+                      key={t.id}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => pick({ name: t.name })}
+                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                    >
+                      <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.7 }}>
+                        {t.entity_type}
+                        {t.city ? ` • ${t.city}` : ""}
+                        {t.parent_name ? ` • ${t.parent_name}` : ""}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
           ) : (
             <div>
-              {items.map((it, idx) => (
-                <div
-                  key={it.id}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => pick(it)}
-                  style={{
-                    padding: "10px 12px",
-                    cursor: "pointer",
-                    background: idx === activeIdx ? "#f5f7ff" : "white",
-                    borderBottom: "1px solid #f2f2f2",
-                  }}
-                >
-                  <div style={{ fontSize: 14, fontWeight: 600 }}>{it.name}</div>
-                  <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>
-                    {groupLabel(it.entity_type)}
-                    {it.city ? ` • ${it.city}` : ""}
-                    {it.parent_name ? ` • ${it.parent_name}` : ""}
-                  </div>
+              {/* Non-empty query */}
+              {resp?.did_you_mean ? (
+                <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
+                  Did you mean{" "}
+                  <button
+                    onClick={() => submit(resp.did_you_mean!)}
+                    style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
+                  >
+                    {resp.did_you_mean}
+                  </button>
+                  ?
                 </div>
-              ))}
+              ) : null}
+
+              {items.length > 0 ? (
+                <div>
+                  {items.map((it, idx) => (
+                    <div
+                      key={it.id}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => pick(it)}
+                      style={{
+                        padding: "10px 12px",
+                        cursor: "pointer",
+                        background: idx === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
+                        borderBottom: "1px solid rgba(255,255,255,0.06)",
+                      }}
+                    >
+                      <div style={{ fontSize: 14, fontWeight: 700 }}>{it.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
+                        {groupLabel(it.entity_type)}
+                        {it.city ? ` • ${it.city}` : ""}
+                        {it.parent_name ? ` • ${it.parent_name}` : ""}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ padding: "12px" }}>
+                  {/* This is the main change you asked for */}
+                  {showNoResultsWhileTyping ? (
+                    <>
+                      <div style={{ fontSize: 14, fontWeight: 800 }}>No results found</div>
+                      <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                        Try a different spelling or choose from trending.
+                      </div>
+
+                      {trend.length > 0 ? (
+                        <div style={{ marginTop: 12 }}>
+                          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
+                          {trend.slice(0, 6).map((t: any) => (
+                            <div
+                              key={t.id}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => pick({ name: t.name })}
+                              style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                            >
+                              <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                                {t.entity_type}
+                                {t.city ? ` • ${t.city}` : ""}
+                                {t.parent_name ? ` • ${t.parent_name}` : ""}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

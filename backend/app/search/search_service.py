@@ -98,7 +98,7 @@ def _relaxed_query(q_norm: str, city_id: Optional[str], fetch_size: int) -> Dict
         ],
     }
 
-def _trending(city_id: Optional[str], limit: int = 10) -> List[Dict[str, Any]]:
+def get_trending(city_id: Optional[str], limit: int = 10) -> List[Dict[str, Any]]:
     es = get_es()
     body: Dict[str, Any] = {
         "size": limit,
@@ -135,7 +135,7 @@ def search(q: str, city_id: Optional[str] = None, limit: int = 20) -> Dict[str, 
             "normalized_q": q_norm,
             "did_you_mean": None,
             "groups": {"locations": [], "projects": [], "builders": [], "rate_pages": [], "property_pdps": []},
-            "fallbacks": {"reason": "empty", "relaxed_used": False, "trending": _trending(city_id, 10)},
+            "fallbacks": {"reason": "empty", "relaxed_used": False, "trending": get_trending(city_id, 10)},
         }
 
     # Fetch more than needed; grouping will cap.
@@ -172,7 +172,7 @@ def search(q: str, city_id: Optional[str] = None, limit: int = 20) -> Dict[str, 
     }
     if total_returned == 0:
         fallbacks["reason"] = "no_results"
-        fallbacks["trending"] = _trending(city_id, 10)
+        fallbacks["trending"] = get_trending(city_id, 10)
     else:
         fallbacks["reason"] = None
 

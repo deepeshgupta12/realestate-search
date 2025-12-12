@@ -32,3 +32,12 @@ def search_serp(
     context_url: Optional[str] = None,
 ):
     return search(q=q, city_id=city_id, limit=limit)
+
+@router.get("/trending")
+def search_trending(
+    city_id: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=25),
+):
+    # trending is popularity-based fallback suggestions
+    from app.search.search_service import get_trending
+    return {"city_id": city_id, "items": get_trending(city_id, limit)}
