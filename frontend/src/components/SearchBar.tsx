@@ -1,60 +1,19 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { resolve, suggest, trending } from "@/lib/api";
 import type { SuggestItem, SuggestResponse } from "@/lib/types";
 
-type Props = {
-  initialQuery?: string;
-  initialCityId?: string;
-};
+type CityOption = { id: string; name: string };
 
-const CITY_OPTIONS = [
-  { label: "All Cities", value: "" },
-  { label: "Pune", value: "city_pune" },
-  { label: "Noida", value: "city_noida" },
+const CITY_OPTIONS: CityOption[] = [
+  { id: "", name: "All Cities" },
+  { id: "city_pune", name: "Pune" },
+  { id: "city_noida", name: "Noida" },
 ];
 
-type RecentItem = { q: string; cityId: string; ts: number };
-
-const LS_KEY = "re_search_recent_v1";
-
-function loadRecents(): RecentItem[] {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed as RecentItem[];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecent(item: RecentItem) {
-  const recents = loadRecents();
-  const next = [
-    item,
-    ...recents.filter(
-      (r) => !(r.q.toLowerCase() === item.q.toLowerCase() && r.cityId === item.cityId)
-    ),
-  ].slice(0, 8);
-  localStorage.setItem(LS_KEY, JSON.stringify(next));
-}
-
-function groupKey(entityType: string): "locations" | "projects" | "builders" | "rate_pages" | "property_pdps" | "other" {
-  if (["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType))
-    return "locations";
-  if (entityType === "project") return "projects";
-  if (entityType === "builder") return "builders";
-  if (entityType === "rate_page") return "rate_pages";
-  if (entityType === "property_pdp") return "property_pdps";
-  return "other";
-}
-
-function groupLabel(k: string): string {
+function labelForGroupKey(k: string): string {
   if (k === "locations") return "Locations";
   if (k === "projects") return "Projects";
   if (k === "builders") return "Builders";
@@ -63,599 +22,541 @@ function groupLabel(k: string): string {
   return "Other";
 }
 
-function badge(entityType: string): string {
-  if (["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType)) return "LOC";
-  if (entityType === "project") return "PRJ";
-  if (entityType === "builder") return "DEV";
-  if (entityType === "rate_page") return "RATE";
-  if (entityType === "property_pdp") return "PROP";
-  return "ITEM";
+function shortTypeTag(entityType: string): string {
+  const t = (entityType || "").toLowerCase();
+  if (t === "locality" || t === "micromarket" || t === "city") return "LOC";
+  if (t === "project") return "PRJ";
+  if (t === "builder") return "BLD";
+  if (t === "rate_page") return "RATE";
+  if (t === "property_pdp") return "PROP";
+  return t ? t.slice(0, 4).toUpperCase() : "ITEM";
 }
 
-function highlight(text: string, q: string): React.ReactNode {
-  const query = q.trim();
-  if (!query) return text;
-
-  const t = text;
-  const lowerT = t.toLowerCase();
-  const lowerQ = query.toLowerCase();
-
-  const idx = lowerT.indexOf(lowerQ);
-  if (idx < 0) return text;
-
-  const before = t.slice(0, idx);
-  const mid = t.slice(idx, idx + query.length);
-  const after = t.slice(idx + query.length);
-
-  return (
-    <>
-      {before}
-      <span style={{ background: "rgba(138,180,255,0.22)", padding: "0 2px", borderRadius: 4 }}>
-        {mid}
-      </span>
-      {after}
-    </>
-  );
+function metaLine(it: SuggestItem): string {
+  const parts: string[] = [];
+  if (it.entity_type) parts.push(it.entity_type);
+  if (it.city) parts.push(it.city);
+  if (it.parent_name) parts.push(it.parent_name);
+  return parts.join(" • ");
 }
 
-type Row =
-  | { kind: "item"; item: SuggestItem }
-  | { kind: "see_all"; q: string };
+type FlatRow =
+  | { kind: "header"; key: string; label: string }
+  | { kind: "item"; key: string; group: string; item: SuggestItem }
+  | { kind: "action"; key: string; label: string };
 
-export default function SearchBar({ initialQuery, initialCityId }: Props) {
+export default function SearchBar({
+  initialQuery = "",
+  initialCityId = "",
+}: {
+  initialQuery?: string;
+  initialCityId?: string;
+}) {
   const router = useRouter();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const [q, setQ] = useState(initialQuery || "");
-  const [cityId, setCityId] = useState(initialCityId || "");
+  const [cityId, setCityId] = useState<string>(initialCityId || "");
+  const [q, setQ] = useState<string>(initialQuery || "");
+  const [open, setOpen] = useState<boolean>(false);
 
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState<SuggestResponse | null>(null);
-  const [open, setOpen] = useState(false);
-  const [activeIdx, setActiveIdx] = useState(-1);
-  const [error, setError] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
-  const [trend, setTrend] = useState<any[]>([]);
-  const [recents, setRecents] = useState<RecentItem[]>([]);
+  const [activeIndex, setActiveIndex] = useState<number>(-1);
 
-  const lastReq = useRef(0);
+  const debRef = useRef<any>(null);
 
-  // Portal anchor
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const dropdownRef = useRef<HTMLDivElement | null>(null);
-  const [anchor, setAnchor] = useState<{ left: number; top: number; width: number } | null>(null);
+  const flatRows: FlatRow[] = useMemo(() => {
+    const rows: FlatRow[] = [];
+    const r = resp;
+    if (!open) return rows;
 
-  const flatItems = useMemo(() => {
-    if (!resp) return [];
-    return [
-      ...resp.groups.locations,
-      ...resp.groups.projects,
-      ...resp.groups.builders,
-      ...resp.groups.rate_pages,
-      ...resp.groups.property_pdps,
+    // Empty query: show recent + trending (we only have trending API now)
+    if (!q.trim()) {
+      rows.push({ kind: "header", key: "hdr_tr", label: "Trending" });
+      const items = r?.fallbacks?.trending || [];
+      for (const it of items) {
+        rows.push({ kind: "item", key: `tr_${it.id}`, group: "trending", item: it });
+      }
+      rows.push({ kind: "action", key: "act_all_empty", label: "Search all" });
+      return rows;
+    }
+
+    if (!r) return rows;
+
+    // Did you mean (as an action row)
+    if (r.did_you_mean) {
+      rows.push({
+        kind: "action",
+        key: "act_dym",
+        label: `Did you mean ${r.did_you_mean}?`,
+      });
+    }
+
+    const groups: Array<[string, SuggestItem[]]> = [
+      ["locations", r.groups.locations],
+      ["projects", r.groups.projects],
+      ["builders", r.groups.builders],
+      ["rate_pages", r.groups.rate_pages],
+      ["property_pdps", r.groups.property_pdps],
     ];
-  }, [resp]);
 
-  const grouped = useMemo(() => {
-    const g: Record<string, SuggestItem[]> = {
-      locations: [],
-      projects: [],
-      builders: [],
-      rate_pages: [],
-      property_pdps: [],
-      other: [],
-    };
-    for (const it of flatItems) g[groupKey(it.entity_type)].push(it);
-    return g;
-  }, [flatItems]);
+    let any = false;
+    for (const [k, items] of groups) {
+      if (!items.length) continue;
+      any = true;
+      rows.push({ kind: "header", key: `hdr_${k}`, label: labelForGroupKey(k) });
+      for (const it of items) {
+        rows.push({ kind: "item", key: `${k}_${it.id}`, group: k, item: it });
+      }
+    }
 
-  const hasAnySuggestions = useMemo(() => {
-    return flatItems.length > 0 || Boolean(resp?.did_you_mean);
-  }, [flatItems.length, resp?.did_you_mean]);
+    if (!any) {
+      rows.push({ kind: "header", key: "hdr_nr", label: "No results found" });
+      const tr = r.fallbacks?.trending || [];
+      if (tr.length) {
+        rows.push({ kind: "header", key: "hdr_tr2", label: "Trending" });
+        for (const it of tr) {
+          rows.push({ kind: "item", key: `tr2_${it.id}`, group: "trending", item: it });
+        }
+      }
+    }
 
-  const showNoResultsWhileTyping = useMemo(() => {
-    return q.trim().length > 0 && !hasAnySuggestions;
-  }, [q, hasAnySuggestions]);
+    rows.push({ kind: "action", key: "act_all", label: `See all results for "${q.trim()}"` });
+    return rows;
+  }, [resp, open, q]);
 
-  // Visible rows for keyboard navigation
-  const rows: Row[] = useMemo(() => {
-    const query = q.trim();
-    if (!query) return [];
+  const selectableIndices = useMemo(() => {
+    const idx: number[] = [];
+    flatRows.forEach((r, i) => {
+      if (r.kind === "item" || r.kind === "action") idx.push(i);
+    });
+    return idx;
+  }, [flatRows]);
 
-    const list: Row[] = [];
-    for (const it of flatItems) list.push({ kind: "item", item: it });
+  function firstSelectableIndex(): number {
+    return selectableIndices.length ? selectableIndices[0] : -1;
+  }
 
-    // Always offer see-all for any non-empty query
-    list.push({ kind: "see_all", q: query });
-    return list;
-  }, [flatItems, q]);
+  function clampActive(next: number): number {
+    if (!selectableIndices.length) return -1;
+    const set = new Set(selectableIndices);
+    if (set.has(next)) return next;
+    // fallback to first
+    return firstSelectableIndex();
+  }
 
-  // Load recents once
+  function moveActive(delta: 1 | -1) {
+    if (!selectableIndices.length) return;
+    const cur = activeIndex;
+    if (cur === -1) {
+      setActiveIndex(firstSelectableIndex());
+      return;
+    }
+    const pos = selectableIndices.indexOf(cur);
+    const nextPos = Math.min(Math.max(pos + delta, 0), selectableIndices.length - 1);
+    setActiveIndex(selectableIndices[nextPos]);
+  }
+
+  async function ensureBaseTrending() {
+    try {
+      const tr = await trending(cityId || undefined, 10);
+      setResp((prev) => {
+        // keep current if exists; just ensure fallbacks.trending present
+        const base: SuggestResponse =
+          prev ||
+          ({
+            q: "",
+            normalized_q: "",
+            did_you_mean: null,
+            groups: { locations: [], projects: [], builders: [], rate_pages: [], property_pdps: [] },
+            fallbacks: { relaxed_used: false, trending: [], reason: null },
+          } as any);
+        return {
+          ...base,
+          fallbacks: { ...base.fallbacks, trending: tr.items || [] },
+        };
+      });
+    } catch {
+      // ignore trending errors
+    }
+  }
+
+  // Click outside closes dropdown
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    setRecents(loadRecents());
-  }, []);
-
-  // Compute portal position when open
-  useEffect(() => {
-    if (!open) return;
-
-    const update = () => {
+    function onDoc(e: MouseEvent) {
       const el = containerRef.current;
       if (!el) return;
-      const rect = el.getBoundingClientRect();
-      setAnchor({
-        left: rect.left,
-        top: rect.bottom + 6,
-        width: rect.width,
-      });
-    };
-
-    update();
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
-
-    return () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-    };
-  }, [open]);
-
-  // Close dropdown on outside click
-  useEffect(() => {
-    if (!open) return;
-
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node | null;
-      if (!t) return;
-      const inContainer = containerRef.current?.contains(t);
-      const inDropdown = dropdownRef.current?.contains(t);
-      if (!inContainer && !inDropdown) {
+      if (!el.contains(e.target as any)) {
         setOpen(false);
-        setActiveIdx(-1);
+        setActiveIndex(-1);
       }
-    };
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
 
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
-
-  // Fetch trending (city-scoped) when dropdown opens or city changes
-  useEffect(() => {
-    if (!open) return;
-    trending(cityId || undefined, 10)
-      .then((r) => setTrend(r.items || []))
-      .catch(() => setTrend([]));
-  }, [open, cityId]);
+  // On focus: open + load trending if empty
+  async function onFocus() {
+    setOpen(true);
+    setErr(null);
+    setActiveIndex(-1);
+    if (!q.trim()) await ensureBaseTrending();
+  }
 
   // Debounced suggest
   useEffect(() => {
+    if (!open) return;
+
     const query = q.trim();
-    if (query.length < 1) {
-      setResp(null);
-      setActiveIdx(-1);
+    setErr(null);
+
+    if (debRef.current) clearTimeout(debRef.current);
+
+    // Empty: show trending
+    if (!query) {
+      setLoading(false);
+      ensureBaseTrending();
       return;
     }
 
-    const reqId = ++lastReq.current;
     setLoading(true);
-    setError(null);
 
-    const t = setTimeout(() => {
-      suggest(query, cityId || undefined, 10)
-        .then((r) => {
-          if (reqId !== lastReq.current) return;
-          setResp(r);
-          setOpen(true);
-          setActiveIdx(-1);
-        })
-        .catch((e) => {
-          if (reqId !== lastReq.current) return;
-          setError(e.message || "Suggest failed");
-          setResp(null);
-        })
-        .finally(() => {
-          if (reqId !== lastReq.current) return;
-          setLoading(false);
-        });
-    }, 150);
+    debRef.current = setTimeout(async () => {
+      try {
+        const r = await suggest(query, cityId || undefined, 10);
 
-    return () => clearTimeout(t);
-  }, [q, cityId]);
+        // If nothing found, we still want trending in the dropdown
+        if (
+          r.groups.locations.length === 0 &&
+          r.groups.projects.length === 0 &&
+          r.groups.builders.length === 0 &&
+          r.groups.rate_pages.length === 0 &&
+          r.groups.property_pdps.length === 0
+        ) {
+          const tr = await trending(cityId || undefined, 10).catch(() => ({ items: [] as any[] }));
+          r.fallbacks.trending = (tr as any).items || [];
+          r.fallbacks.relaxed_used = true;
+          r.fallbacks.reason = "no_results";
+        }
 
-  function recordRecent(queryText: string) {
-    if (typeof window === "undefined") return;
-    const queryTrim = queryText.trim();
-    if (!queryTrim) return;
-    saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
-    setRecents(loadRecents());
-  }
+        setResp(r);
+        setLoading(false);
+        setActiveIndex(-1);
+      } catch (e: any) {
+        setLoading(false);
+        setErr(e?.message || "Suggest failed");
+      }
+    }, 160);
 
-  function goToUrl(url: string, queryText: string) {
-    recordRecent(queryText);
-    setOpen(false);
-    setActiveIdx(-1);
-    router.push(`/go?url=${encodeURIComponent(url)}&q=${encodeURIComponent(queryText)}`);
-  }
+    return () => {
+      if (debRef.current) clearTimeout(debRef.current);
+    };
+  }, [q, cityId, open]);
 
-  function goToSerp(queryText: string) {
-    const queryTrim = queryText.trim();
-    if (!queryTrim) return;
-
-    recordRecent(queryTrim);
-    setOpen(false);
-    setActiveIdx(-1);
-
-    const params = new URLSearchParams({ q: queryTrim });
+  function goSERP(query: string) {
+    const params = new URLSearchParams();
+    params.set("q", query);
     if (cityId) params.set("city_id", cityId);
     router.push(`/search?${params.toString()}`);
+    setOpen(false);
+    setActiveIndex(-1);
   }
 
-  async function submitRawQuery(query: string) {
-    const queryTrim = query.trim();
-    if (!queryTrim) return;
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const r = await resolve(queryTrim, cityId || undefined);
-      recordRecent(queryTrim);
-
-      if (r.action === "redirect") {
-        router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(queryTrim)}`);
-        return;
-      }
-
-      const params = new URLSearchParams({ q: queryTrim });
-      if (cityId) params.set("city_id", cityId);
-      router.push(`/search?${params.toString()}`);
-    } catch (e: any) {
-      setError(e.message || "Resolve failed");
-    } finally {
-      setLoading(false);
+  async function goResolve(query: string) {
+    const r = await resolve(query, cityId || undefined);
+    if (r.action === "redirect") {
+      router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(query)}`);
       setOpen(false);
-      setActiveIdx(-1);
+      setActiveIndex(-1);
+    } else {
+      goSERP(query);
     }
   }
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (!open) {
-      if (e.key === "Enter") submitRawQuery(q);
+  function onPickItem(it: SuggestItem) {
+    router.push(`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(it.name)}`);
+    setOpen(false);
+    setActiveIndex(-1);
+  }
+
+  async function onEnter() {
+    // If dropdown has an active selectable row, trigger it.
+    if (activeIndex !== -1 && flatRows[activeIndex]) {
+      const row = flatRows[activeIndex];
+      if (row.kind === "item") {
+        onPickItem(row.item);
+        return;
+      }
+      if (row.kind === "action") {
+        // Did you mean
+        if (row.key === "act_dym" && resp?.did_you_mean) {
+          goSERP(resp.did_you_mean);
+          return;
+        }
+        // See all
+        goSERP(q.trim() || "");
+        return;
+      }
+    }
+
+    // Otherwise fallback: resolve whole query (smart redirect vs SERP)
+    const query = q.trim();
+    if (!query) return;
+    await goResolve(query);
+  }
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (!open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      setOpen(true);
+      return;
+    }
+
+    if (e.key === "Escape") {
+      setOpen(false);
+      setActiveIndex(-1);
       return;
     }
 
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIdx((v) => Math.min(v + 1, rows.length - 1));
-    } else if (e.key === "ArrowUp") {
+      moveActive(1);
+      return;
+    }
+
+    if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActiveIdx((v) => Math.max(v - 1, -1));
-    } else if (e.key === "Enter") {
+      moveActive(-1);
+      return;
+    }
+
+    if (e.key === "Enter") {
       e.preventDefault();
-      if (activeIdx >= 0 && activeIdx < rows.length) {
-        const r = rows[activeIdx];
-        if (r.kind === "item") {
-          const it = r.item;
-          if (it.canonical_url) goToUrl(it.canonical_url, it.name);
-          else submitRawQuery(it.name);
-        } else {
-          goToSerp(r.q);
-        }
-      } else {
-        submitRawQuery(q);
-      }
-    } else if (e.key === "Escape") {
-      setOpen(false);
-      setActiveIdx(-1);
+      onEnter();
+      return;
     }
   }
 
-  function renderItem(it: SuggestItem, rowIndex: number) {
-    return (
-      <div
-        key={it.id}
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => (it.canonical_url ? goToUrl(it.canonical_url, it.name) : submitRawQuery(it.name))}
-        style={{
-          padding: "10px 12px",
-          cursor: "pointer",
-          background: rowIndex === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
-          borderBottom: "1px solid rgba(255,255,255,0.06)",
-          display: "flex",
-          gap: 10,
-          alignItems: "flex-start",
-        }}
-      >
-        <div
-          style={{
-            minWidth: 44,
-            textAlign: "center",
-            fontSize: 11,
-            fontWeight: 800,
-            padding: "5px 6px",
-            borderRadius: 8,
-            background: "rgba(255,255,255,0.08)",
-            border: "1px solid rgba(255,255,255,0.10)",
-            lineHeight: "12px",
-          }}
-        >
-          {badge(it.entity_type)}
-        </div>
-
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 750 }}>{highlight(it.name, q)}</div>
-          <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
-            {it.entity_type}
-            {it.city ? ` • ${it.city}` : ""}
-            {it.parent_name ? ` • ${it.parent_name}` : ""}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  function renderSeeAll(rowIndex: number) {
-    return (
-      <div
-        key="see_all"
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => goToSerp(q)}
-        style={{
-          padding: "12px",
-          cursor: "pointer",
-          background: rowIndex === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
-          borderTop: "1px solid rgba(255,255,255,0.10)",
-          fontSize: 14,
-          fontWeight: 750,
-        }}
-      >
-        See all results for <span style={{ opacity: 0.9 }}>"{q.trim()}"</span>
-      </div>
-    );
-  }
-
-  // Build sectioned UI but keep a consistent rowIndex for keyboard highlight
-  const dropdownInner = (() => {
-    const query = q.trim();
-
-    // Empty query: show Recents + Trending
-    if (!query) {
-      return (
-        <div>
-          {recents.length > 0 ? (
-            <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)" }}>
-              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Recent searches</div>
-              {recents.map((r) => (
-                <div
-                  key={`${r.q}-${r.cityId}-${r.ts}`}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => submitRawQuery(r.q)}
-                  style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                >
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>{r.q}</div>
-                  <div style={{ fontSize: 12, opacity: 0.7 }}>
-                    {r.cityId ? `City: ${r.cityId}` : "All Cities"}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : null}
-
-          <div style={{ padding: "10px 12px" }}>
-            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
-            {trend.length === 0 ? (
-              <div style={{ fontSize: 14, opacity: 0.7 }}>No trending items</div>
-            ) : (
-              trend.slice(0, 10).map((t: any) => (
-                <div
-                  key={t.id}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
-                  style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                >
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
-                  <div style={{ fontSize: 12, opacity: 0.7 }}>
-                    {t.entity_type}
-                    {t.city ? ` • ${t.city}` : ""}
-                    {t.parent_name ? ` • ${t.parent_name}` : ""}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      );
+  // Ensure active index always lands on a selectable row
+  useEffect(() => {
+    if (!open) return;
+    if (!flatRows.length) {
+      setActiveIndex(-1);
+      return;
     }
-
-    // Non-empty query
-    if (flatItems.length === 0) {
-      return (
-        <div style={{ padding: "12px" }}>
-          {resp?.did_you_mean ? (
-            <div style={{ marginBottom: 10, fontSize: 14 }}>
-              Did you mean{" "}
-              <button
-                onClick={() => submitRawQuery(resp.did_you_mean!)}
-                style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
-              >
-                {resp.did_you_mean}
-              </button>
-              ?
-            </div>
-          ) : null}
-
-          {showNoResultsWhileTyping ? (
-            <>
-              <div style={{ fontSize: 14, fontWeight: 850 }}>No results found</div>
-              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
-                Try a different spelling or choose from trending.
-              </div>
-
-              {trend.length > 0 ? (
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
-                  {trend.slice(0, 10).map((t: any) => (
-                    <div
-                      key={t.id}
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
-                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                    >
-                      <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
-                      <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        {t.entity_type}
-                        {t.city ? ` • ${t.city}` : ""}
-                        {t.parent_name ? ` • ${t.parent_name}` : ""}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              {/* still give see-all */}
-              {renderSeeAll(rows.length - 1)}
-            </>
-          ) : (
-            <>
-              <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
-              {renderSeeAll(rows.length - 1)}
-            </>
-          )}
-        </div>
-      );
-    }
-
-    // Have suggestions: render sectioned + keep consistent rowIndex
-    let rowIndex = 0;
-
-    return (
-      <div>
-        {resp?.did_you_mean ? (
-          <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
-            Did you mean{" "}
-            <button
-              onClick={() => submitRawQuery(resp.did_you_mean!)}
-              style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
-            >
-              {resp.did_you_mean}
-            </button>
-            ?
-          </div>
-        ) : null}
-
-        {Object.entries(grouped).map(([k, arr]) => {
-          if (!arr || arr.length === 0 || k === "other") return null;
-
-          return (
-            <div key={k}>
-              <div
-                style={{
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  fontWeight: 800,
-                  opacity: 0.8,
-                  borderTop: "1px solid rgba(255,255,255,0.10)",
-                  background: "rgba(255,255,255,0.03)",
-                }}
-              >
-                {groupLabel(k)}
-              </div>
-
-              {arr.map((it) => {
-                const ri = rowIndex;
-                rowIndex += 1;
-                return renderItem(it, ri);
-              })}
-            </div>
-          );
-        })}
-
-        {/* See all row always at end */}
-        {renderSeeAll(rowIndex)}
-      </div>
-    );
-  })();
+    setActiveIndex((prev) => {
+      if (prev === -1) return -1;
+      return clampActive(prev);
+    });
+  }, [flatRows, open]);
 
   return (
-    <div ref={containerRef} style={{ maxWidth: 760, width: "100%" }}>
-      <div style={{ display: "flex", gap: 8 }}>
+    <div ref={containerRef} style={{ position: "relative" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
         <select
           value={cityId}
           onChange={(e) => setCityId(e.target.value)}
           style={{
-            padding: "10px 12px",
+            height: 38,
             borderRadius: 8,
             border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.04)",
+            background: "rgba(255,255,255,0.06)",
             color: "inherit",
+            padding: "0 10px",
+            outline: "none",
           }}
+          aria-label="City"
         >
           {CITY_OPTIONS.map((c) => (
-            <option key={c.value} value={c.value}>
-              {c.label}
+            <option key={c.id} value={c.id}>
+              {c.name}
             </option>
           ))}
         </select>
 
         <input
+          ref={inputRef}
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          onFocus={onFocus}
           onKeyDown={onKeyDown}
-          onFocus={() => setOpen(true)}
           placeholder="Search city, locality, project, builder, rates, properties…"
           style={{
             flex: 1,
-            padding: "10px 12px",
+            height: 38,
             borderRadius: 8,
             border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.04)",
+            background: "rgba(255,255,255,0.06)",
             color: "inherit",
+            padding: "0 12px",
             outline: "none",
           }}
         />
 
         <button
-          onClick={() => submitRawQuery(q)}
+          onClick={() => onEnter()}
           style={{
-            padding: "10px 14px",
+            height: 38,
+            padding: "0 14px",
             borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.25)",
-            background: "rgba(255,255,255,0.10)",
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: "rgba(255,255,255,0.06)",
             color: "inherit",
             cursor: "pointer",
           }}
         >
-          {loading ? "…" : "Search"}
+          Search
         </button>
       </div>
 
-      {error ? <div style={{ marginTop: 8, color: "crimson", fontSize: 14 }}>{error}</div> : null}
+      {open ? (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: 46,
+            zIndex: 50,
+            borderRadius: 12,
+            border: "1px solid rgba(255,255,255,0.14)",
+            background: "rgba(20,20,22,0.95)",
+            boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              maxHeight: 360,
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+            }}
+            onWheel={(e) => {
+              // Prevent the page from scrolling while the dropdown can scroll
+              e.stopPropagation();
+            }}
+          >
+            {loading ? (
+              <div style={{ padding: 12, fontSize: 13, opacity: 0.8 }}>Loading…</div>
+            ) : null}
 
-      {open && anchor && typeof document !== "undefined"
-        ? createPortal(
-            <div
-              ref={dropdownRef}
-              onWheelCapture={(e) => e.stopPropagation()}
-              style={{
-                position: "fixed",
-                top: anchor.top,
-                left: anchor.left,
-                width: anchor.width,
-                border: "1px solid rgba(255,255,255,0.18)",
-                borderRadius: 10,
-                background: "rgba(20,20,24,0.98)",
-                boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
-                overflowY: "auto",
-                maxHeight: "min(560px, calc(100vh - 140px))",
-                overscrollBehavior: "contain",
-                zIndex: 9999,
-              }}
-            >
-              {dropdownInner}
-            </div>,
-            document.body
-          )
-        : null}
+            {err ? (
+              <div style={{ padding: 12, fontSize: 13, color: "crimson" }}>{err}</div>
+            ) : null}
+
+            {flatRows.length === 0 && !loading ? (
+              <div style={{ padding: 12, fontSize: 13, opacity: 0.75 }}>
+                Start typing to see suggestions.
+              </div>
+            ) : null}
+
+            {flatRows.map((row, idx) => {
+              if (row.kind === "header") {
+                return (
+                  <div
+                    key={row.key}
+                    style={{
+                      padding: "10px 12px 6px",
+                      fontSize: 12,
+                      fontWeight: 850,
+                      opacity: 0.85,
+                      borderTop: "1px solid rgba(255,255,255,0.06)",
+                    }}
+                  >
+                    {row.label}
+                  </div>
+                );
+              }
+
+              const isActive = idx === activeIndex;
+
+              if (row.kind === "action") {
+                const isDym = row.key === "act_dym";
+                return (
+                  <div
+                    key={row.key}
+                    onMouseEnter={() => setActiveIndex(idx)}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      if (isDym && resp?.did_you_mean) {
+                        goSERP(resp.did_you_mean);
+                      } else {
+                        goSERP(q.trim() || "");
+                      }
+                    }}
+                    style={{
+                      padding: "12px",
+                      cursor: "pointer",
+                      background: isActive ? "rgba(138,180,255,0.18)" : "transparent",
+                      borderTop: "1px solid rgba(255,255,255,0.06)",
+                      fontSize: 13,
+                      fontWeight: 750,
+                      color: isDym ? "#8ab4ff" : "inherit",
+                    }}
+                  >
+                    {row.label}
+                  </div>
+                );
+              }
+
+              const it = row.item;
+              return (
+                <div
+                  key={row.key}
+                  onMouseEnter={() => setActiveIndex(idx)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onPickItem(it)}
+                  style={{
+                    padding: "10px 12px",
+                    cursor: "pointer",
+                    background: isActive ? "rgba(138,180,255,0.18)" : "transparent",
+                    borderTop: "1px solid rgba(255,255,255,0.06)",
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "flex-start",
+                  }}
+                >
+                  <div
+                    style={{
+                      minWidth: 40,
+                      height: 20,
+                      borderRadius: 999,
+                      border: "1px solid rgba(255,255,255,0.18)",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 11,
+                      opacity: 0.9,
+                      padding: "0 8px",
+                      marginTop: 2,
+                    }}
+                  >
+                    {shortTypeTag(it.entity_type)}
+                  </div>
+
+                  <div style={{ lineHeight: 1.15 }}>
+                    <div style={{ fontSize: 13, fontWeight: 850 }}>{it.name}</div>
+                    <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>{metaLine(it)}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* small footer hint */}
+          <div
+            style={{
+              padding: "8px 12px",
+              fontSize: 11,
+              opacity: 0.65,
+              borderTop: "1px solid rgba(255,255,255,0.08)",
+            }}
+          >
+            ↑↓ to navigate • Enter to select • Esc to close
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
