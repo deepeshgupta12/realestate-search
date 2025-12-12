@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -330,7 +331,6 @@ def group_entities(entities: List[EntityOut]) -> Dict[str, List[EntityOut]]:
 
 
 def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
-    must: List[Dict[str, Any]] = []
     if city_id:
         # include global items too by OR-ing empty city_id
         q = {
@@ -355,6 +355,13 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     )
     hits = res.get("hits", {}).get("hits", [])
     return [hit_to_entity(h, for_trending=True) for h in hits]
+
+
+def build_serp_url(q: str, city_id: Optional[str]) -> str:
+    url = f"/search?q={quote_plus(q)}"
+    if city_id:
+        url += f"&city_id={quote_plus(city_id)}"
+    return url
 
 
 # -----------------------
@@ -423,7 +430,6 @@ def search_serp(
 
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
     if sum(len(v) for v in groups.values()) == 0:
-        # SERP-style no results: show trending
         fallbacks["relaxed_used"] = True
         fallbacks["reason"] = "no_results"
         fallbacks["trending"] = fetch_trending(city_id=city_id, limit=8)
@@ -451,7 +457,6 @@ def suggest(
     entities = [hit_to_entity(h) for h in hits]
     groups = group_entities(entities)
 
-    # Autocomplete UX: if empty, show trending in dropdown
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
     if sum(len(v) for v in groups.values()) == 0:
         fallbacks["relaxed_used"] = True
@@ -472,22 +477,27 @@ def suggest(
 
 
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(q: str):
-    # if query has constraints -> send to SERP
+def resolve(
+    q: str = Query(..., min_length=1),
+    city_id: Optional[str] = None,
+):
+    # if query has constraints -> send to SERP (ALWAYS include url)
     if is_constraint_heavy(q):
         return ResolveResponse(
             action="serp",
             query=q,
             normalized_query=q,
+            url=build_serp_url(q, city_id),
             reason="constraint_heavy",
         )
 
-    hits, _ = es_search_entities(q=q, limit=5, city_id=None)
+    hits, _ = es_search_entities(q=q, limit=5, city_id=city_id)
     if not hits:
         return ResolveResponse(
             action="serp",
             query=q,
             normalized_query=q,
+            url=build_serp_url(q, city_id),
             reason="no_results",
         )
 
@@ -498,7 +508,6 @@ def resolve(q: str):
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
 
     match = hit_to_entity(top)
-    # threshold tuned for demo; refine later with evals
     if top_score >= 5.0 and gap >= 0.30:
         return ResolveResponse(
             action="redirect",
@@ -513,6 +522,7 @@ def resolve(q: str):
         action="serp",
         query=q,
         normalized_query=q,
+        url=build_serp_url(q, city_id),
         reason="ambiguous",
         debug={"top_score": top_score, "second_score": second_score, "gap": gap},
     )
