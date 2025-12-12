@@ -1,16 +1,15 @@
-// frontend/app/page.tsx
-import SearchBox from "@/components/SearchBar";
+import SearchBar from "@/components/SearchBar";
 
 export default function HomePage() {
   return (
-    <main className="min-h-screen bg-[#0b0c0f] text-white">
-      <div className="max-w-5xl mx-auto px-6 pt-20">
-        <h1 className="text-4xl font-semibold">Real Estate Search (Local)</h1>
-        <p className="mt-2 opacity-70">Autocomplete + typo correction + resolve + SERP (Elastic-backed).</p>
+    <main className="page">
+      <h1 className="h1">Real Estate Search (Local)</h1>
+      <p className="sub">Autocomplete + typo correction + resolve + SERP (Elastic-backed).</p>
 
-        <div className="mt-10">
-          <SearchBox />
-        </div>
+      <SearchBar />
+
+      <div className="serpMeta">
+        Tip: try <strong>Baner</strong>, <strong>Godrej wods</strong>, or <strong>zzzzzz</strong>.
       </div>
     </main>
   );

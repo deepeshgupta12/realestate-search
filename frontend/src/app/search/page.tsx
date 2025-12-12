@@ -1,136 +1,117 @@
-import Link from "next/link";
 import SearchBar from "@/components/SearchBar";
 import { apiGet } from "@/lib/api";
-import type { SearchResponse, SearchEntity } from "@/lib/types";
+import type { SuggestResponse, SuggestItem } from "@/lib/types";
 
-type SearchParamsShape = { q?: string; city_id?: string };
-type Props = {
-  searchParams: Promise<SearchParamsShape> | SearchParamsShape;
-};
-
-function Section({
-  title,
-  items,
-  q,
-}: {
-  title: string;
-  items: SearchEntity[];
-  q: string;
-}) {
-  if (!items?.length) return null;
-
-  return (
-    <div style={{ marginTop: 18 }}>
-      <h3 style={{ margin: "0 0 10px 0" }}>{title}</h3>
-      <div style={{ display: "grid", gap: 12 }}>
-        {items.map((it) => (
-          <div
-            key={`${it.entity_type}:${it.id}`}
-            style={{
-              border: "1px solid rgba(255,255,255,0.18)",
-              borderRadius: 10,
-              padding: 14,
-              background: "rgba(255,255,255,0.03)",
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>{it.name}</div>
-            <div style={{ opacity: 0.75, fontSize: 12, marginTop: 4 }}>
-              {it.entity_type}
-              {it.city ? ` • ${it.city}` : ""}
-              {it.parent_name ? ` • ${it.parent_name}` : ""}
-            </div>
-            <div style={{ marginTop: 10 }}>
-              <Link
-                href={`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(
-                  q
-                )}`}
-                style={{ opacity: 0.9 }}
-              >
-                URL: {it.canonical_url}
-              </Link>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+function groupToSections(r: SuggestResponse): Array<{ title: string; items: SuggestItem[] }> {
+  const s: Array<{ title: string; items: SuggestItem[] }> = [];
+  if (r.groups.locations.length) s.push({ title: "Locations", items: r.groups.locations });
+  if (r.groups.projects.length) s.push({ title: "Projects", items: r.groups.projects });
+  if (r.groups.builders.length) s.push({ title: "Builders", items: r.groups.builders });
+  if (r.groups.rate_pages.length) s.push({ title: "Property Rates", items: r.groups.rate_pages });
+  if (r.groups.property_pdps.length) s.push({ title: "Properties", items: r.groups.property_pdps });
+  return s;
 }
 
-export default async function SearchPage({ searchParams }: Props) {
-  const sp = await Promise.resolve(searchParams as SearchParamsShape);
+export default async function SearchPage({
+  searchParams,
+}: {
+  // Next 16 can treat this as async in some cases; normalize with Promise.resolve
+  searchParams: any;
+}) {
+  const sp = await Promise.resolve(searchParams);
+  const q = String(sp?.q || "").trim();
+  const city_id = String(sp?.city_id || "").trim();
 
-  const q = (sp?.q ?? "").trim();
-  const city_id = (sp?.city_id ?? "").trim();
-
-  // Always show the search bar (even if q is empty)
   if (!q) {
     return (
-      <main style={{ maxWidth: 980, margin: "0 auto", padding: "48px 20px" }}>
-        <h1 style={{ marginBottom: 8 }}>Search</h1>
-        <p style={{ opacity: 0.75, marginTop: 0 }}>
-          Type a query to see results.
-        </p>
-        <div style={{ marginTop: 18 }}>
-          <SearchBar />
-        </div>
+      <main className="page">
+        <h1 className="h1">Search</h1>
+        <p className="sub">Type a query to see results.</p>
+        <SearchBar initialQ="" initialCityId={city_id} />
       </main>
     );
   }
 
-  const data = await apiGet<SearchResponse>("/api/v1/search", {
+  const data = await apiGet<SuggestResponse>("/api/v1/search", {
     q,
-    ...(city_id ? { city_id } : {}),
+    city_id: city_id || undefined,
   });
 
-  const groups = data.groups || {
-    locations: [],
-    projects: [],
-    builders: [],
-    rate_pages: [],
-    property_pdps: [],
-  };
+  const sections = groupToSections(data);
+  const total =
+    data.groups.locations.length +
+    data.groups.projects.length +
+    data.groups.builders.length +
+    data.groups.rate_pages.length +
+    data.groups.property_pdps.length;
 
   return (
-    <main style={{ maxWidth: 980, margin: "0 auto", padding: "48px 20px" }}>
-      <div style={{ marginBottom: 18 }}>
-        <SearchBar initialQuery={q} initialCityId={city_id} />
+    <main className="page">
+      <SearchBar initialQ={q} initialCityId={city_id} />
+
+      <div className="serpMeta">
+        Query: <strong>{q}</strong>
+        <br />
+        Results: <strong>{total}</strong>
+        {data.did_you_mean ? (
+          <>
+            <br />
+            Did you mean: <strong>{data.did_you_mean}</strong>
+          </>
+        ) : null}
       </div>
 
-      <div style={{ opacity: 0.75, marginBottom: 10 }}>
-        Query: <b>{data.q}</b>
-      </div>
-
-      {data.did_you_mean ? (
-        <div style={{ marginBottom: 16 }}>
-          Did you mean{" "}
-          <Link href={`/search?q=${encodeURIComponent(data.did_you_mean)}`}>
-            {data.did_you_mean}
-          </Link>
-          ?
+      {total === 0 ? (
+        <div className="card">
+          <div style={{ fontWeight: 700 }}>No results found</div>
+          <div style={{ color: "rgba(255,255,255,0.65)", marginTop: 6 }}>
+            Try a different query.
+          </div>
         </div>
-      ) : null}
+      ) : (
+        sections.map((sec) => (
+          <section key={sec.title}>
+            <div className="groupTitle">{sec.title}</div>
+            {sec.items.map((it) => (
+              <div key={it.id} className="resultCard">
+                <div style={{ fontWeight: 700 }}>{it.name}</div>
+                <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                  {(it.entity_type || "")}
+                  {it.city ? ` • ${it.city}` : ""}
+                  {it.parent_name ? ` • ${it.parent_name}` : ""}
+                </div>
+                <div style={{ marginTop: 8, fontSize: 13 }}>
+                  URL:{" "}
+                  <a className="link" href={`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(q)}`}>
+                    {it.canonical_url}
+                  </a>
+                </div>
+              </div>
+            ))}
+          </section>
+        ))
+      )}
 
-      <div style={{ opacity: 0.8, marginBottom: 18 }}>
-        Results:{" "}
-        {[
-          groups.locations?.length || 0,
-          groups.projects?.length || 0,
-          groups.builders?.length || 0,
-          groups.rate_pages?.length || 0,
-          groups.property_pdps?.length || 0,
-        ].reduce((a, b) => a + b, 0)}
-      </div>
-
-      <Section title="Locations" items={groups.locations || []} q={q} />
-      <Section title="Projects" items={groups.projects || []} q={q} />
-      <Section title="Builders" items={groups.builders || []} q={q} />
-      <Section title="Property Rates" items={groups.rate_pages || []} q={q} />
-      <Section title="Properties" items={groups.property_pdps || []} q={q} />
-
-      {data.fallbacks?.relaxed_used ? (
-        <div style={{ marginTop: 24, opacity: 0.8 }}>
-          Tried relaxed matching. Reason: {data.fallbacks.reason}
-        </div>
+      {data.fallbacks?.trending?.length ? (
+        <>
+          <div className="groupTitle">Trending</div>
+          {data.fallbacks.trending.map((it) => (
+            <div key={it.id} className="resultCard">
+              <div style={{ fontWeight: 700 }}>{it.name}</div>
+              <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                {it.entity_type}
+                {it.city ? ` • ${it.city}` : ""}
+                {it.parent_name ? ` • ${it.parent_name}` : ""}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 13 }}>
+                URL:{" "}
+                <a className="link" href={`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(it.name)}`}>
+                  {it.canonical_url}
+                </a>
+              </div>
+            </div>
+          ))}
+        </>
       ) : null}
     </main>
   );

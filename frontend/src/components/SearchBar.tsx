@@ -1,378 +1,334 @@
-// frontend/components/SearchBox.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React from "react";
 import { useRouter } from "next/navigation";
 import { apiGet } from "@/lib/api";
+import type { SuggestItem, SuggestResponse, TrendingResponse } from "@/lib/types";
 
-type Entity = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
-  canonical_url: string;
-  score?: number;
-  popularity_score?: number;
-};
+const CITY_OPTIONS = [
+  { id: "", name: "All Cities" },
+  { id: "city_pune", name: "Pune" },
+  { id: "city_noida", name: "Noida" },
+];
 
-type SuggestResponse = {
-  q: string;
-  normalized_q: string;
-  did_you_mean: string | null;
-  groups: {
-    locations: Entity[];
-    projects: Entity[];
-    builders: Entity[];
-    rate_pages: Entity[];
-    property_pdps: Entity[];
-  };
-  fallbacks?: {
-    relaxed_used: boolean;
-    trending: Entity[];
-    reason: string | null;
-  };
-};
-
-type ResolveResponse =
-  | { action: "redirect"; url: string; query: string; normalized_query?: string }
-  | { action: "serp"; url: null; query: string; normalized_query?: string; reason?: string };
-
-type TrendingResponse = { city_id: string | null; items: Entity[] };
-
-const RECENT_KEY = "re_recent_searches_v1";
-
-function pushRecent(q: string, cityId: string | null) {
-  try {
-    const raw = localStorage.getItem(RECENT_KEY);
-    const arr: { q: string; city_id: string | null; ts: number }[] = raw ? JSON.parse(raw) : [];
-    const next = [{ q, city_id: cityId, ts: Date.now() }, ...arr.filter(x => x.q !== q)].slice(0, 8);
-    localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-  } catch {}
+function isEmptyGroups(r: SuggestResponse): boolean {
+  const g = r.groups;
+  return (
+    g.locations.length === 0 &&
+    g.projects.length === 0 &&
+    g.builders.length === 0 &&
+    g.rate_pages.length === 0 &&
+    g.property_pdps.length === 0
+  );
 }
 
-function readRecent(): { q: string; city_id: string | null; ts: number }[] {
-  try {
-    const raw = localStorage.getItem(RECENT_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
+function badgeFor(entityType: string): string {
+  switch (entityType) {
+    case "locality":
+      return "LOC";
+    case "micromarket":
+      return "MM";
+    case "city":
+      return "CITY";
+    case "project":
+      return "PRJ";
+    case "builder":
+      return "BLD";
+    case "rate_page":
+      return "RATE";
+    case "property_pdp":
+      return "PROP";
+    default:
+      return entityType.toUpperCase().slice(0, 4);
   }
 }
 
-export default function SearchBox() {
+function highlight(text: string, q: string): React.ReactNode {
+  const needle = q.trim();
+  if (!needle) return text;
+  const idx = text.toLowerCase().indexOf(needle.toLowerCase());
+  if (idx < 0) return text;
+  const before = text.slice(0, idx);
+  const hit = text.slice(idx, idx + needle.length);
+  const after = text.slice(idx + needle.length);
+  return (
+    <>
+      {before}
+      <mark>{hit}</mark>
+      {after}
+    </>
+  );
+}
+
+function formatMeta(it: SuggestItem): string {
+  const parts: string[] = [];
+  if (it.entity_type) parts.push(it.entity_type);
+  const city = (it.city || "").trim();
+  if (city) parts.push(city);
+  const parent = (it.parent_name || "").trim();
+  if (parent) parts.push(parent);
+  return parts.join(" • ");
+}
+
+export default function SearchBar({
+  initialQ = "",
+  initialCityId = "",
+}: {
+  initialQ?: string;
+  initialCityId?: string;
+}) {
   const router = useRouter();
 
-  const [q, setQ] = useState("");
-  const [cityId, setCityId] = useState<string>(""); // empty = all cities
-  const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [q, setQ] = React.useState(initialQ);
+  const [cityId, setCityId] = React.useState(initialCityId);
+  const [open, setOpen] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
 
-  const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
-  const [trending, setTrending] = useState<Entity[]>([]);
-  const [recent, setRecent] = useState<{ q: string; city_id: string | null }[]>([]);
+  const [didYouMean, setDidYouMean] = React.useState<string | null>(null);
+  const [sections, setSections] = React.useState<
+    Array<{ title: string; items: SuggestItem[] }>
+  >([]);
+  const [noResults, setNoResults] = React.useState(false);
+  const [trending, setTrending] = React.useState<SuggestItem[]>([]);
+  const boxRef = React.useRef<HTMLDivElement | null>(null);
 
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const debounceRef = React.useRef<number | null>(null);
 
-  const normalizedCityId = cityId.trim();
+  async function loadTrending(nextCityId: string) {
+    const r = await apiGet<TrendingResponse>("/api/v1/search/trending", {
+      city_id: nextCityId || undefined,
+      limit: 8,
+    });
+    setTrending(r.items || []);
+  }
 
-  // Debounce suggest calls
-  const debouncedQ = useMemo(() => q.trim(), [q]);
-
-  useEffect(() => {
-    // recent on mount
-    const r = readRecent().map(x => ({ q: x.q, city_id: x.city_id }));
-    setRecent(r);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadTrending() {
-      try {
-        const resp = await apiGet<TrendingResponse>("/api/v1/search/trending", {
-          limit: 8,
-          city_id: normalizedCityId || null,
-        });
-        if (!cancelled) setTrending(resp.items || []);
-      } catch {
-        if (!cancelled) setTrending([]);
-      }
-    }
-
-    // When input is empty, show trending + recent
-    if (!debouncedQ) {
-      setSuggest(null);
-      loadTrending();
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    const t = setTimeout(async () => {
-      setLoading(true);
-      try {
-        const resp = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
-          q: debouncedQ,
-          limit: 10,
-          city_id: normalizedCityId || null,
-        });
-        if (!cancelled) setSuggest(resp);
-      } catch {
-        if (!cancelled) setSuggest(null);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }, 200);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [debouncedQ, normalizedCityId]);
-
-  // Close dropdown on outside click
-  useEffect(() => {
-    function onDocClick(e: MouseEvent) {
-      const target = e.target as Node;
-      if (panelRef.current && !panelRef.current.contains(target)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
-  }, []);
-
-  function goToSERP(query: string) {
-    pushRecent(query, normalizedCityId || null);
-    const params = new URLSearchParams();
-    params.set("q", query);
-    if (normalizedCityId) params.set("city_id", normalizedCityId);
-    router.push(`/search?${params.toString()}`);
+  function goToSerp(query: string, nextCityId: string) {
+    const qp = new URLSearchParams();
+    qp.set("q", query);
+    if (nextCityId) qp.set("city_id", nextCityId);
+    router.push(`/search?${qp.toString()}`);
     setOpen(false);
   }
 
-  function goToRedirect(query: string, url: string) {
-    pushRecent(query, normalizedCityId || null);
-    const params = new URLSearchParams();
-    params.set("q", query);
-    params.set("url", url);
-    router.push(`/go?${params.toString()}`);
+  function goToUrl(url: string, query: string) {
+    const qp = new URLSearchParams();
+    qp.set("url", url);
+    qp.set("q", query);
+    router.push(`/go?${qp.toString()}`);
     setOpen(false);
   }
 
-  async function onSubmit() {
-    const query = q.trim();
-    if (!query) return;
-
+  async function refreshDropdown(nextQ: string, nextCityId: string) {
+    const trimmed = nextQ.trim();
     setLoading(true);
+    setNoResults(false);
+    setDidYouMean(null);
+    setSections([]);
+
     try {
-      const resp = await apiGet<ResolveResponse>("/api/v1/search/resolve", {
-        q: query,
-        city_id: normalizedCityId || null,
+      if (!trimmed) {
+        await loadTrending(nextCityId);
+        setOpen(true);
+        return;
+      }
+
+      const r = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
+        q: trimmed,
+        city_id: nextCityId || undefined,
+        limit: 10,
       });
 
-      if (resp.action === "redirect" && resp.url) {
-        goToRedirect(query, resp.url);
-      } else {
-        goToSERP(query);
+      setDidYouMean(r.did_you_mean);
+
+      const s: Array<{ title: string; items: SuggestItem[] }> = [];
+      if (r.groups.locations.length) s.push({ title: "Locations", items: r.groups.locations });
+      if (r.groups.projects.length) s.push({ title: "Projects", items: r.groups.projects });
+      if (r.groups.builders.length) s.push({ title: "Builders", items: r.groups.builders });
+      if (r.groups.rate_pages.length) s.push({ title: "Property Rates", items: r.groups.rate_pages });
+      if (r.groups.property_pdps.length) s.push({ title: "Properties", items: r.groups.property_pdps });
+
+      setSections(s);
+
+      const empty = isEmptyGroups(r);
+      if (empty) {
+        setNoResults(true);
+        // Prefer backend-provided trending fallback; else fetch trending
+        if (r.fallbacks?.trending?.length) {
+          setTrending(r.fallbacks.trending);
+        } else {
+          await loadTrending(nextCityId);
+        }
       }
-    } catch {
-      // If resolve fails, fall back to SERP
-      goToSERP(query);
+
+      setOpen(true);
     } finally {
       setLoading(false);
     }
   }
 
-  function renderEntityRow(e: Entity) {
-    const subtitle = [e.entity_type, e.city ? `• ${e.city}` : "", e.parent_name ? `• ${e.parent_name}` : ""]
-      .filter(Boolean)
-      .join(" ");
-
-    return (
-      <button
-        key={e.id}
-        className="w-full text-left px-3 py-2 hover:bg-white/10"
-        onClick={() => goToRedirect(q.trim() || e.name, e.canonical_url)}
-        type="button"
-      >
-        <div className="font-medium">{e.name}</div>
-        <div className="text-xs opacity-70">{subtitle}</div>
-      </button>
-    );
+  function onChange(next: string) {
+    setQ(next);
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    debounceRef.current = window.setTimeout(() => {
+      refreshDropdown(next, cityId).catch(() => {
+        setNoResults(true);
+        setSections([]);
+        setDidYouMean(null);
+        setOpen(true);
+      });
+    }, 180);
   }
 
-  const groups = suggest?.groups;
-  const totalResults =
-    (groups?.locations?.length || 0) +
-    (groups?.projects?.length || 0) +
-    (groups?.builders?.length || 0) +
-    (groups?.rate_pages?.length || 0) +
-    (groups?.property_pdps?.length || 0);
+  function onSubmit() {
+    const trimmed = q.trim();
+    if (!trimmed) {
+      setOpen(true);
+      return;
+    }
+    goToSerp(trimmed, cityId);
+  }
 
-  const showNoResults = !!debouncedQ && suggest && totalResults === 0;
+  React.useEffect(() => {
+    // close on outside click
+    function onDocClick(e: MouseEvent) {
+      const el = boxRef.current;
+      if (!el) return;
+      if (!el.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  React.useEffect(() => {
+    // ensure trending loaded for empty query on first focus
+    if (!q.trim()) {
+      loadTrending(cityId).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
-    <div className="relative max-w-3xl mx-auto" ref={panelRef}>
-      <div className="flex gap-2 items-center">
+    <div className="searchWrap" ref={boxRef}>
+      <div className="controls">
         <select
-          className="bg-white/5 border border-white/15 rounded-md px-2 py-2 text-sm"
+          className="select"
           value={cityId}
-          onChange={(e) => setCityId(e.target.value)}
+          onChange={(e) => {
+            const nextCityId = e.target.value;
+            setCityId(nextCityId);
+            // refresh dropdown based on current query
+            refreshDropdown(q, nextCityId).catch(() => {});
+          }}
         >
-          <option value="">All Cities</option>
-          <option value="city_pune">Pune</option>
-          <option value="city_noida">Noida</option>
+          {CITY_OPTIONS.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
         </select>
 
         <input
-          ref={inputRef}
-          className="flex-1 bg-white/5 border border-white/15 rounded-md px-3 py-2"
+          className="input"
           placeholder="Search city, locality, project, builder, rates, properties..."
           value={q}
-          onChange={(e) => {
-            setQ(e.target.value);
-            setOpen(true);
+          onChange={(e) => onChange(e.target.value)}
+          onFocus={() => {
+            refreshDropdown(q, cityId).catch(() => setOpen(true));
           }}
-          onFocus={() => setOpen(true)}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
               onSubmit();
             }
-            if (e.key === "Escape") setOpen(false);
           }}
         />
 
-        <button
-          className="bg-white/10 border border-white/15 rounded-md px-4 py-2"
-          onClick={onSubmit}
-          type="button"
-          disabled={loading}
-        >
-          {loading ? "..." : "Search"}
+        <button className="btn" onClick={onSubmit}>
+          Search
         </button>
       </div>
 
       {open && (
         <div
-          className="absolute left-0 right-0 mt-2 bg-[#14161a] border border-white/15 rounded-lg overflow-hidden z-50"
-          style={{
-            // fixes: dropdown must be fully visible + scroll inside panel only
-            maxHeight: "420px",
-            overflowY: "auto",
-            overscrollBehavior: "contain",
-          }}
+          className="dropdown"
           onWheel={(e) => {
-            // Prevent page scroll when wheel happens on panel
+            // Critical: stop wheel events from scrolling the whole page behind the dropdown.
             e.stopPropagation();
           }}
         >
-          {/* Empty query: show recent + trending */}
-          {!debouncedQ && (
-            <div className="py-2">
-              {recent.length > 0 && (
-                <div className="px-3 py-2 text-xs opacity-70">Recent searches</div>
-              )}
-              {recent.map((r, idx) => (
-                <button
-                  key={`${r.q}-${idx}`}
-                  className="w-full text-left px-3 py-2 hover:bg-white/10"
-                  onClick={() => {
-                    setQ(r.q);
-                    inputRef.current?.focus();
-                  }}
-                  type="button"
+          {loading && <div className="sectionTitle">Loading…</div>}
+
+          {!loading && didYouMean && q.trim() && didYouMean.toLowerCase() !== q.trim().toLowerCase() && (
+            <div className="didYouMean">
+              Did you mean <strong>{didYouMean}</strong>?
+            </div>
+          )}
+
+          {!loading && sections.map((sec) => (
+            <div key={sec.title}>
+              <div className="sectionTitle">{sec.title}</div>
+              {sec.items.map((it) => (
+                <div
+                  key={it.id}
+                  className="item"
+                  onClick={() => goToUrl(it.canonical_url, q.trim())}
                 >
-                  <div className="font-medium">{r.q}</div>
-                  <div className="text-xs opacity-70">{r.city_id ? r.city_id : "All Cities"}</div>
-                </button>
+                  <div className="badge">{badgeFor(it.entity_type)}</div>
+                  <div className="itemMain">
+                    <div className="itemName">{highlight(it.name, q)}</div>
+                    <div className="itemMeta">{formatMeta(it)}</div>
+                  </div>
+                </div>
               ))}
-
-              <div className="px-3 py-2 text-xs opacity-70 border-t border-white/10 mt-2">Trending</div>
-              {trending.map((e) => renderEntityRow(e))}
             </div>
-          )}
+          ))}
 
-          {/* Typed query: show suggestions */}
-          {!!debouncedQ && (
-            <div className="py-2">
-              {suggest?.did_you_mean && (
-                <div className="px-3 py-2 text-sm">
-                  Did you mean{" "}
-                  <button
-                    className="underline underline-offset-2"
-                    type="button"
-                    onClick={() => setQ(suggest.did_you_mean || "")}
-                  >
-                    {suggest.did_you_mean}
-                  </button>
-                  ?
-                </div>
-              )}
-
-              {!showNoResults && (
-                <>
-                  {groups?.locations?.length ? (
-                    <>
-                      <div className="px-3 py-2 text-xs opacity-70">Locations</div>
-                      {groups.locations.map(renderEntityRow)}
-                    </>
-                  ) : null}
-
-                  {groups?.projects?.length ? (
-                    <>
-                      <div className="px-3 py-2 text-xs opacity-70 border-t border-white/10">Projects</div>
-                      {groups.projects.map(renderEntityRow)}
-                    </>
-                  ) : null}
-
-                  {groups?.builders?.length ? (
-                    <>
-                      <div className="px-3 py-2 text-xs opacity-70 border-t border-white/10">Builders</div>
-                      {groups.builders.map(renderEntityRow)}
-                    </>
-                  ) : null}
-
-                  {groups?.rate_pages?.length ? (
-                    <>
-                      <div className="px-3 py-2 text-xs opacity-70 border-t border-white/10">Property Rates</div>
-                      {groups.rate_pages.map(renderEntityRow)}
-                    </>
-                  ) : null}
-
-                  {groups?.property_pdps?.length ? (
-                    <>
-                      <div className="px-3 py-2 text-xs opacity-70 border-t border-white/10">Properties</div>
-                      {groups.property_pdps.map(renderEntityRow)}
-                    </>
-                  ) : null}
-                </>
-              )}
-
-              {showNoResults && (
-                <div className="py-2">
-                  <div className="px-3 py-2 font-medium">No results found</div>
-                  <div className="px-3 pb-2 text-sm opacity-70">Try a different spelling or choose from trending.</div>
-                  <div className="px-3 py-2 text-xs opacity-70">Trending</div>
-                  {(suggest?.fallbacks?.trending || trending).map(renderEntityRow)}
-                </div>
-              )}
-
-              <div className="border-t border-white/10 mt-2">
-                <button
-                  className="w-full text-left px-3 py-3 hover:bg-white/10 font-medium"
-                  type="button"
-                  onClick={() => goToSERP(q.trim())}
+          {!loading && noResults && (
+            <div>
+              <div className="sectionTitle">No results found</div>
+              <div className="didYouMean">Try a different spelling or choose from trending.</div>
+              <div className="sectionTitle">Trending</div>
+              {trending.map((it) => (
+                <div
+                  key={it.id}
+                  className="item"
+                  onClick={() => goToUrl(it.canonical_url, q.trim() || it.name)}
                 >
-                  See all results for "{q.trim()}"
-                </button>
-              </div>
+                  <div className="badge">{badgeFor(it.entity_type)}</div>
+                  <div className="itemMain">
+                    <div className="itemName">{it.name}</div>
+                    <div className="itemMeta">{formatMeta(it)}</div>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
+
+          {!loading && !q.trim() && trending.length > 0 && (
+            <div>
+              <div className="sectionTitle">Trending</div>
+              {trending.map((it) => (
+                <div
+                  key={it.id}
+                  className="item"
+                  onClick={() => goToUrl(it.canonical_url, it.name)}
+                >
+                  <div className="badge">{badgeFor(it.entity_type)}</div>
+                  <div className="itemMain">
+                    <div className="itemName">{it.name}</div>
+                    <div className="itemMeta">{formatMeta(it)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div
+            className="footerAction"
+            onClick={() => goToSerp(q.trim() || "", cityId)}
+          >
+            See all results for "{(q.trim() || "").slice(0, 80)}"
+          </div>
         </div>
       )}
     </div>

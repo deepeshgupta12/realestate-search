@@ -2,21 +2,18 @@ export type EntityType =
   | "city"
   | "micromarket"
   | "locality"
-  | "listing_page"
-  | "locality_overview"
-  | "rate_page"
   | "project"
   | "builder"
-  | "property_pdp"
-  | string;
+  | "rate_page"
+  | "property_pdp";
 
 export type SuggestItem = {
   id: string;
   entity_type: EntityType;
   name: string;
-  city: string;
-  city_id: string;
-  parent_name: string;
+  city?: string;
+  city_id?: string;
+  parent_name?: string;
   canonical_url: string;
   score?: number;
   popularity_score?: number;
@@ -44,23 +41,15 @@ export type SuggestResponse = {
   fallbacks: SuggestFallbacks;
 };
 
-export type ResolveResponse =
-  | {
-      action: "redirect";
-      query: string;
-      normalized_query: string;
-      url: string;
-      match: SuggestItem;
-      debug?: any;
-    }
-  | {
-      action: "serp";
-      query: string;
-      normalized_query: string;
-      reason: string;
-    };
-
 export type TrendingResponse = {
   city_id: string | null;
   items: SuggestItem[];
+};
+
+export type ResolveResponse = {
+  action: "redirect" | "serp";
+  query: string;
+  normalized_query: string;
+  url: string | null;
+  reason?: string | null;
 };
