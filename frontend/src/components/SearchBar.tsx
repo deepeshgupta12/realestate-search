@@ -98,6 +98,10 @@ function highlight(text: string, q: string): React.ReactNode {
   );
 }
 
+type Row =
+  | { kind: "item"; item: SuggestItem }
+  | { kind: "see_all"; q: string };
+
 export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const router = useRouter();
 
@@ -151,6 +155,19 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const showNoResultsWhileTyping = useMemo(() => {
     return q.trim().length > 0 && !hasAnySuggestions;
   }, [q, hasAnySuggestions]);
+
+  // Visible rows for keyboard navigation
+  const rows: Row[] = useMemo(() => {
+    const query = q.trim();
+    if (!query) return [];
+
+    const list: Row[] = [];
+    for (const it of flatItems) list.push({ kind: "item", item: it });
+
+    // Always offer see-all for any non-empty query
+    list.push({ kind: "see_all", q: query });
+    return list;
+  }, [flatItems, q]);
 
   // Load recents once
   useEffect(() => {
@@ -260,6 +277,19 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     router.push(`/go?url=${encodeURIComponent(url)}&q=${encodeURIComponent(queryText)}`);
   }
 
+  function goToSerp(queryText: string) {
+    const queryTrim = queryText.trim();
+    if (!queryTrim) return;
+
+    recordRecent(queryTrim);
+    setOpen(false);
+    setActiveIdx(-1);
+
+    const params = new URLSearchParams({ q: queryTrim });
+    if (cityId) params.set("city_id", cityId);
+    router.push(`/search?${params.toString()}`);
+  }
+
   async function submitRawQuery(query: string) {
     const queryTrim = query.trim();
     if (!queryTrim) return;
@@ -288,7 +318,6 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     }
   }
 
-  // Keyboard nav is flat across sections for simplicity
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!open) {
       if (e.key === "Enter") submitRawQuery(q);
@@ -297,15 +326,21 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIdx((v) => Math.min(v + 1, flatItems.length - 1));
+      setActiveIdx((v) => Math.min(v + 1, rows.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setActiveIdx((v) => Math.max(v - 1, -1));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const selected = activeIdx >= 0 ? flatItems[activeIdx] : null;
-      if (selected?.canonical_url) {
-        goToUrl(selected.canonical_url, selected.name);
+      if (activeIdx >= 0 && activeIdx < rows.length) {
+        const r = rows[activeIdx];
+        if (r.kind === "item") {
+          const it = r.item;
+          if (it.canonical_url) goToUrl(it.canonical_url, it.name);
+          else submitRawQuery(it.name);
+        } else {
+          goToSerp(r.q);
+        }
       } else {
         submitRawQuery(q);
       }
@@ -315,7 +350,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     }
   }
 
-  function renderItem(it: SuggestItem, idxFlat: number) {
+  function renderItem(it: SuggestItem, rowIndex: number) {
     return (
       <div
         key={it.id}
@@ -324,7 +359,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
         style={{
           padding: "10px 12px",
           cursor: "pointer",
-          background: idxFlat === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
+          background: rowIndex === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
           borderBottom: "1px solid rgba(255,255,255,0.06)",
           display: "flex",
           gap: 10,
@@ -359,10 +394,33 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     );
   }
 
-  const dropdownInner = (
-    <div>
-      {/* Empty query: show Recents + Trending */}
-      {q.trim().length === 0 ? (
+  function renderSeeAll(rowIndex: number) {
+    return (
+      <div
+        key="see_all"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => goToSerp(q)}
+        style={{
+          padding: "12px",
+          cursor: "pointer",
+          background: rowIndex === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
+          borderTop: "1px solid rgba(255,255,255,0.10)",
+          fontSize: 14,
+          fontWeight: 750,
+        }}
+      >
+        See all results for <span style={{ opacity: 0.9 }}>"{q.trim()}"</span>
+      </div>
+    );
+  }
+
+  // Build sectioned UI but keep a consistent rowIndex for keyboard highlight
+  const dropdownInner = (() => {
+    const query = q.trim();
+
+    // Empty query: show Recents + Trending
+    if (!query) {
+      return (
         <div>
           {recents.length > 0 ? (
             <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)" }}>
@@ -406,11 +464,15 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
             )}
           </div>
         </div>
-      ) : (
-        <div>
-          {/* Non-empty query */}
+      );
+    }
+
+    // Non-empty query
+    if (flatItems.length === 0) {
+      return (
+        <div style={{ padding: "12px" }}>
           {resp?.did_you_mean ? (
-            <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
+            <div style={{ marginBottom: 10, fontSize: 14 }}>
               Did you mean{" "}
               <button
                 onClick={() => submitRawQuery(resp.did_you_mean!)}
@@ -422,74 +484,97 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
             </div>
           ) : null}
 
-          {flatItems.length > 0 ? (
-            <div>
-              {Object.entries(grouped).map(([k, arr]) => {
-                if (!arr || arr.length === 0 || k === "other") return null;
+          {showNoResultsWhileTyping ? (
+            <>
+              <div style={{ fontSize: 14, fontWeight: 850 }}>No results found</div>
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                Try a different spelling or choose from trending.
+              </div>
 
-                // Render section header + items
-                // Need idxFlat mapping for keyboard highlight: compute by scanning flatItems
-                return (
-                  <div key={k}>
+              {trend.length > 0 ? (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
+                  {trend.slice(0, 10).map((t: any) => (
                     <div
-                      style={{
-                        padding: "10px 12px",
-                        fontSize: 12,
-                        fontWeight: 800,
-                        opacity: 0.8,
-                        borderTop: "1px solid rgba(255,255,255,0.10)",
-                        background: "rgba(255,255,255,0.03)",
-                      }}
+                      key={t.id}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
+                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                     >
-                      {groupLabel(k)}
+                      <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.7 }}>
+                        {t.entity_type}
+                        {t.city ? ` • ${t.city}` : ""}
+                        {t.parent_name ? ` • ${t.parent_name}` : ""}
+                      </div>
                     </div>
-                    {arr.map((it) => {
-                      const idxFlat = flatItems.findIndex((x) => x.id === it.id);
-                      return renderItem(it, idxFlat);
-                    })}
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div style={{ padding: "12px" }}>
-              {showNoResultsWhileTyping ? (
-                <>
-                  <div style={{ fontSize: 14, fontWeight: 850 }}>No results found</div>
-                  <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
-                    Try a different spelling or choose from trending.
-                  </div>
+                  ))}
+                </div>
+              ) : null}
 
-                  {trend.length > 0 ? (
-                    <div style={{ marginTop: 12 }}>
-                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
-                      {trend.slice(0, 10).map((t: any) => (
-                        <div
-                          key={t.id}
-                          onMouseDown={(e) => e.preventDefault()}
-                          onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
-                          style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                        >
-                          <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
-                          <div style={{ fontSize: 12, opacity: 0.7 }}>
-                            {t.entity_type}
-                            {t.city ? ` • ${t.city}` : ""}
-                            {t.parent_name ? ` • ${t.parent_name}` : ""}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                </>
-              ) : (
-                <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
-              )}
-            </div>
+              {/* still give see-all */}
+              {renderSeeAll(rows.length - 1)}
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
+              {renderSeeAll(rows.length - 1)}
+            </>
           )}
         </div>
-      )}
-    </div>
-  );
+      );
+    }
+
+    // Have suggestions: render sectioned + keep consistent rowIndex
+    let rowIndex = 0;
+
+    return (
+      <div>
+        {resp?.did_you_mean ? (
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
+            Did you mean{" "}
+            <button
+              onClick={() => submitRawQuery(resp.did_you_mean!)}
+              style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
+            >
+              {resp.did_you_mean}
+            </button>
+            ?
+          </div>
+        ) : null}
+
+        {Object.entries(grouped).map(([k, arr]) => {
+          if (!arr || arr.length === 0 || k === "other") return null;
+
+          return (
+            <div key={k}>
+              <div
+                style={{
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                  opacity: 0.8,
+                  borderTop: "1px solid rgba(255,255,255,0.10)",
+                  background: "rgba(255,255,255,0.03)",
+                }}
+              >
+                {groupLabel(k)}
+              </div>
+
+              {arr.map((it) => {
+                const ri = rowIndex;
+                rowIndex += 1;
+                return renderItem(it, ri);
+              })}
+            </div>
+          );
+        })}
+
+        {/* See all row always at end */}
+        {renderSeeAll(rowIndex)}
+      </div>
+    );
+  })();
 
   return (
     <div ref={containerRef} style={{ maxWidth: 760, width: "100%" }}>
