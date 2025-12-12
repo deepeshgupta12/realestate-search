@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { resolve, suggest, trending } from "@/lib/api";
 import type { SuggestItem, SuggestResponse } from "@/lib/types";
@@ -45,6 +46,8 @@ type FlatRow =
   | { kind: "item"; key: string; group: string; item: SuggestItem }
   | { kind: "action"; key: string; label: string };
 
+type AnchorRect = { left: number; top: number; width: number };
+
 export default function SearchBar({
   initialQuery = "",
   initialCityId = "",
@@ -65,15 +68,45 @@ export default function SearchBar({
   const [err, setErr] = useState<string | null>(null);
 
   const [activeIndex, setActiveIndex] = useState<number>(-1);
+  const [anchor, setAnchor] = useState<AnchorRect | null>(null);
+  const [mounted, setMounted] = useState(false);
 
   const debRef = useRef<any>(null);
+
+  useEffect(() => setMounted(true), []);
+
+  function computeAnchor() {
+    const el = containerRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    // Our dropdown should start just below the input row.
+    // The input row height is ~38px; plus gap to be safe.
+    const top = r.top + 46; // matches our layout (row + spacing)
+    setAnchor({ left: r.left, top, width: r.width });
+  }
+
+  // Recompute anchor when opening, scrolling, resizing
+  useEffect(() => {
+    if (!open) return;
+
+    computeAnchor();
+
+    const onResize = () => computeAnchor();
+    const onScroll = () => computeAnchor();
+
+    window.addEventListener("resize", onResize);
+    window.addEventListener("scroll", onScroll, true); // capture scroll from any parent
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [open]);
 
   const flatRows: FlatRow[] = useMemo(() => {
     const rows: FlatRow[] = [];
     const r = resp;
     if (!open) return rows;
 
-    // Empty query: show recent + trending (we only have trending API now)
     if (!q.trim()) {
       rows.push({ kind: "header", key: "hdr_tr", label: "Trending" });
       const items = r?.fallbacks?.trending || [];
@@ -86,7 +119,6 @@ export default function SearchBar({
 
     if (!r) return rows;
 
-    // Did you mean (as an action row)
     if (r.did_you_mean) {
       rows.push({
         kind: "action",
@@ -144,7 +176,6 @@ export default function SearchBar({
     if (!selectableIndices.length) return -1;
     const set = new Set(selectableIndices);
     if (set.has(next)) return next;
-    // fallback to first
     return firstSelectableIndex();
   }
 
@@ -164,7 +195,6 @@ export default function SearchBar({
     try {
       const tr = await trending(cityId || undefined, 10);
       setResp((prev) => {
-        // keep current if exists; just ensure fallbacks.trending present
         const base: SuggestResponse =
           prev ||
           ({
@@ -198,11 +228,11 @@ export default function SearchBar({
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  // On focus: open + load trending if empty
   async function onFocus() {
     setOpen(true);
     setErr(null);
     setActiveIndex(-1);
+    computeAnchor();
     if (!q.trim()) await ensureBaseTrending();
   }
 
@@ -215,7 +245,6 @@ export default function SearchBar({
 
     if (debRef.current) clearTimeout(debRef.current);
 
-    // Empty: show trending
     if (!query) {
       setLoading(false);
       ensureBaseTrending();
@@ -228,14 +257,14 @@ export default function SearchBar({
       try {
         const r = await suggest(query, cityId || undefined, 10);
 
-        // If nothing found, we still want trending in the dropdown
-        if (
+        const noHits =
           r.groups.locations.length === 0 &&
           r.groups.projects.length === 0 &&
           r.groups.builders.length === 0 &&
           r.groups.rate_pages.length === 0 &&
-          r.groups.property_pdps.length === 0
-        ) {
+          r.groups.property_pdps.length === 0;
+
+        if (noHits) {
           const tr = await trending(cityId || undefined, 10).catch(() => ({ items: [] as any[] }));
           r.fallbacks.trending = (tr as any).items || [];
           r.fallbacks.relaxed_used = true;
@@ -283,7 +312,6 @@ export default function SearchBar({
   }
 
   async function onEnter() {
-    // If dropdown has an active selectable row, trigger it.
     if (activeIndex !== -1 && flatRows[activeIndex]) {
       const row = flatRows[activeIndex];
       if (row.kind === "item") {
@@ -291,18 +319,15 @@ export default function SearchBar({
         return;
       }
       if (row.kind === "action") {
-        // Did you mean
         if (row.key === "act_dym" && resp?.did_you_mean) {
           goSERP(resp.did_you_mean);
           return;
         }
-        // See all
         goSERP(q.trim() || "");
         return;
       }
     }
 
-    // Otherwise fallback: resolve whole query (smart redirect vs SERP)
     const query = q.trim();
     if (!query) return;
     await goResolve(query);
@@ -311,6 +336,7 @@ export default function SearchBar({
   function onKeyDown(e: React.KeyboardEvent) {
     if (!open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
       setOpen(true);
+      computeAnchor();
       return;
     }
 
@@ -339,7 +365,6 @@ export default function SearchBar({
     }
   }
 
-  // Ensure active index always lands on a selectable row
   useEffect(() => {
     if (!open) return;
     if (!flatRows.length) {
@@ -352,211 +377,220 @@ export default function SearchBar({
     });
   }, [flatRows, open]);
 
-  return (
-    <div ref={containerRef} style={{ position: "relative" }}>
-      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-        <select
-          value={cityId}
-          onChange={(e) => setCityId(e.target.value)}
-          style={{
-            height: 38,
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.06)",
-            color: "inherit",
-            padding: "0 10px",
-            outline: "none",
-          }}
-          aria-label="City"
-        >
-          {CITY_OPTIONS.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </select>
-
-        <input
-          ref={inputRef}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onFocus={onFocus}
-          onKeyDown={onKeyDown}
-          placeholder="Search city, locality, project, builder, rates, properties…"
-          style={{
-            flex: 1,
-            height: 38,
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.06)",
-            color: "inherit",
-            padding: "0 12px",
-            outline: "none",
-          }}
-        />
-
-        <button
-          onClick={() => onEnter()}
-          style={{
-            height: 38,
-            padding: "0 14px",
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.06)",
-            color: "inherit",
-            cursor: "pointer",
-          }}
-        >
-          Search
-        </button>
-      </div>
-
-      {open ? (
-        <div
-          style={{
-            position: "absolute",
-            left: 0,
-            right: 0,
-            top: 46,
-            zIndex: 50,
-            borderRadius: 12,
-            border: "1px solid rgba(255,255,255,0.14)",
-            background: "rgba(20,20,22,0.95)",
-            boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
-            overflow: "hidden",
-          }}
-        >
+  const dropdown =
+    open && mounted && anchor
+      ? createPortal(
           <div
             style={{
-              maxHeight: 360,
-              overflowY: "auto",
-              overscrollBehavior: "contain",
-            }}
-            onWheel={(e) => {
-              // Prevent the page from scrolling while the dropdown can scroll
-              e.stopPropagation();
+              position: "fixed",
+              left: anchor.left,
+              top: anchor.top,
+              width: anchor.width,
+              zIndex: 9999,
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.14)",
+              background: "rgba(20,20,22,0.95)",
+              boxShadow: "0 20px 50px rgba(0,0,0,0.55)",
+              overflow: "hidden",
             }}
           >
-            {loading ? (
-              <div style={{ padding: 12, fontSize: 13, opacity: 0.8 }}>Loading…</div>
-            ) : null}
+            <div
+              style={{
+                maxHeight: 360,
+                overflowY: "auto",
+                overscrollBehavior: "contain",
+              }}
+              onWheel={(e) => {
+                // prevent page scroll while dropdown scrolls
+                e.stopPropagation();
+              }}
+            >
+              {loading ? (
+                <div style={{ padding: 12, fontSize: 13, opacity: 0.8 }}>Loading…</div>
+              ) : null}
 
-            {err ? (
-              <div style={{ padding: 12, fontSize: 13, color: "crimson" }}>{err}</div>
-            ) : null}
+              {err ? (
+                <div style={{ padding: 12, fontSize: 13, color: "crimson" }}>{err}</div>
+              ) : null}
 
-            {flatRows.length === 0 && !loading ? (
-              <div style={{ padding: 12, fontSize: 13, opacity: 0.75 }}>
-                Start typing to see suggestions.
-              </div>
-            ) : null}
+              {flatRows.length === 0 && !loading ? (
+                <div style={{ padding: 12, fontSize: 13, opacity: 0.75 }}>
+                  Start typing to see suggestions.
+                </div>
+              ) : null}
 
-            {flatRows.map((row, idx) => {
-              if (row.kind === "header") {
-                return (
-                  <div
-                    key={row.key}
-                    style={{
-                      padding: "10px 12px 6px",
-                      fontSize: 12,
-                      fontWeight: 850,
-                      opacity: 0.85,
-                      borderTop: "1px solid rgba(255,255,255,0.06)",
-                    }}
-                  >
-                    {row.label}
-                  </div>
-                );
-              }
+              {flatRows.map((row, idx) => {
+                if (row.kind === "header") {
+                  return (
+                    <div
+                      key={row.key}
+                      style={{
+                        padding: "10px 12px 6px",
+                        fontSize: 12,
+                        fontWeight: 850,
+                        opacity: 0.85,
+                        borderTop: "1px solid rgba(255,255,255,0.06)",
+                      }}
+                    >
+                      {row.label}
+                    </div>
+                  );
+                }
 
-              const isActive = idx === activeIndex;
+                const isActive = idx === activeIndex;
 
-              if (row.kind === "action") {
-                const isDym = row.key === "act_dym";
+                if (row.kind === "action") {
+                  const isDym = row.key === "act_dym";
+                  return (
+                    <div
+                      key={row.key}
+                      onMouseEnter={() => setActiveIndex(idx)}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        if (isDym && resp?.did_you_mean) {
+                          goSERP(resp.did_you_mean);
+                        } else {
+                          goSERP(q.trim() || "");
+                        }
+                      }}
+                      style={{
+                        padding: "12px",
+                        cursor: "pointer",
+                        background: isActive ? "rgba(138,180,255,0.18)" : "transparent",
+                        borderTop: "1px solid rgba(255,255,255,0.06)",
+                        fontSize: 13,
+                        fontWeight: 750,
+                        color: isDym ? "#8ab4ff" : "inherit",
+                      }}
+                    >
+                      {row.label}
+                    </div>
+                  );
+                }
+
+                const it = row.item;
                 return (
                   <div
                     key={row.key}
                     onMouseEnter={() => setActiveIndex(idx)}
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => {
-                      if (isDym && resp?.did_you_mean) {
-                        goSERP(resp.did_you_mean);
-                      } else {
-                        goSERP(q.trim() || "");
-                      }
-                    }}
+                    onClick={() => onPickItem(it)}
                     style={{
-                      padding: "12px",
+                      padding: "10px 12px",
                       cursor: "pointer",
                       background: isActive ? "rgba(138,180,255,0.18)" : "transparent",
                       borderTop: "1px solid rgba(255,255,255,0.06)",
-                      fontSize: 13,
-                      fontWeight: 750,
-                      color: isDym ? "#8ab4ff" : "inherit",
+                      display: "flex",
+                      gap: 10,
+                      alignItems: "flex-start",
                     }}
                   >
-                    {row.label}
+                    <div
+                      style={{
+                        minWidth: 40,
+                        height: 20,
+                        borderRadius: 999,
+                        border: "1px solid rgba(255,255,255,0.18)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: 11,
+                        opacity: 0.9,
+                        padding: "0 8px",
+                        marginTop: 2,
+                      }}
+                    >
+                      {shortTypeTag(it.entity_type)}
+                    </div>
+
+                    <div style={{ lineHeight: 1.15 }}>
+                      <div style={{ fontSize: 13, fontWeight: 850 }}>{it.name}</div>
+                      <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
+                        {metaLine(it)}
+                      </div>
+                    </div>
                   </div>
                 );
-              }
+              })}
+            </div>
 
-              const it = row.item;
-              return (
-                <div
-                  key={row.key}
-                  onMouseEnter={() => setActiveIndex(idx)}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => onPickItem(it)}
-                  style={{
-                    padding: "10px 12px",
-                    cursor: "pointer",
-                    background: isActive ? "rgba(138,180,255,0.18)" : "transparent",
-                    borderTop: "1px solid rgba(255,255,255,0.06)",
-                    display: "flex",
-                    gap: 10,
-                    alignItems: "flex-start",
-                  }}
-                >
-                  <div
-                    style={{
-                      minWidth: 40,
-                      height: 20,
-                      borderRadius: 999,
-                      border: "1px solid rgba(255,255,255,0.18)",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 11,
-                      opacity: 0.9,
-                      padding: "0 8px",
-                      marginTop: 2,
-                    }}
-                  >
-                    {shortTypeTag(it.entity_type)}
-                  </div>
+            <div
+              style={{
+                padding: "8px 12px",
+                fontSize: 11,
+                opacity: 0.65,
+                borderTop: "1px solid rgba(255,255,255,0.08)",
+              }}
+            >
+              ↑↓ to navigate • Enter to select • Esc to close
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
 
-                  <div style={{ lineHeight: 1.15 }}>
-                    <div style={{ fontSize: 13, fontWeight: 850 }}>{it.name}</div>
-                    <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>{metaLine(it)}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* small footer hint */}
-          <div
+  return (
+    <>
+      <div ref={containerRef} style={{ position: "relative" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <select
+            value={cityId}
+            onChange={(e) => setCityId(e.target.value)}
             style={{
-              padding: "8px 12px",
-              fontSize: 11,
-              opacity: 0.65,
-              borderTop: "1px solid rgba(255,255,255,0.08)",
+              height: 38,
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(255,255,255,0.06)",
+              color: "inherit",
+              padding: "0 10px",
+              outline: "none",
+            }}
+            aria-label="City"
+          >
+            {CITY_OPTIONS.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+
+          <input
+            ref={inputRef}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onFocus={onFocus}
+            onKeyDown={onKeyDown}
+            placeholder="Search city, locality, project, builder, rates, properties…"
+            style={{
+              flex: 1,
+              height: 38,
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(255,255,255,0.06)",
+              color: "inherit",
+              padding: "0 12px",
+              outline: "none",
+            }}
+          />
+
+          <button
+            onClick={() => onEnter()}
+            style={{
+              height: 38,
+              padding: "0 14px",
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(255,255,255,0.06)",
+              color: "inherit",
+              cursor: "pointer",
             }}
           >
-            ↑↓ to navigate • Enter to select • Esc to close
-          </div>
+            Search
+          </button>
         </div>
-      ) : null}
-    </div>
+      </div>
+
+      {dropdown}
+    </>
   );
 }
