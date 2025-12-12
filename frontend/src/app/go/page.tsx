@@ -1,26 +1,35 @@
-"use client";
-
-import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 
-export default function GoPage() {
-  const sp = useSearchParams();
-  const url = sp.get("url") || "/";
-  const q = sp.get("q") || "";
+// frontend/src/app/go/page.tsx
+function isPromise<T>(v: unknown): v is Promise<T> {
+  return !!v && typeof v === "object" && "then" in v && typeof (v as any).then === "function";
+}
+
+export default async function GoPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string; url?: string }> | { q?: string; url?: string };
+}) {
+  const sp = isPromise<{ q?: string; url?: string }>(searchParams) ? await searchParams : searchParams;
+
+  const q = (sp.q || "").trim();
+  const url = (sp.url || "").trim();
 
   return (
-    <main style={{ padding: "40px 20px", display: "flex", justifyContent: "center" }}>
-      <div style={{ width: "100%", maxWidth: 900 }}>
-        <h1 style={{ fontSize: 22, marginBottom: 8 }}>Redirect (Demo)</h1>
-        <p style={{ color: "#666" }}>
-          Query <b>{q}</b> resolved to:
+    <main className="min-h-screen bg-[#0b0c0f] text-white">
+      <div className="max-w-3xl mx-auto px-6 pt-20">
+        <h1 className="text-3xl font-semibold">Redirect (Demo)</h1>
+        <p className="mt-2 opacity-70">
+          Query <span className="font-semibold">{q}</span> resolved to:
         </p>
-        <div style={{ padding: 12, border: "1px solid #eee", borderRadius: 10 }}>
-          <code style={{ fontSize: 14 }}>{url}</code>
+
+        <div className="mt-6 border border-white/15 rounded-lg p-4 bg-white/5">
+          <div className="font-mono">{url || "(missing url)"}</div>
         </div>
-        <div style={{ marginTop: 16 }}>
-          <Link href="/" style={{ color: "#0b57d0" }}>Back to Home</Link>
-        </div>
+
+        <Link className="inline-block mt-6 underline opacity-80" href="/">
+          Back to Home
+        </Link>
       </div>
     </main>
   );

@@ -1,211 +1,175 @@
-"use client";
+// frontend/src/app/search/page.tsx
+import { apiGet } from "@/lib/api";
 
-import React, { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
-import SearchBar from "@/components/SearchBar";
-import { search as searchApi } from "@/lib/api";
-import type { SuggestItem, SuggestResponse } from "@/lib/types";
+type Entity = {
+  id: string;
+  entity_type: string;
+  name: string;
+  city?: string;
+  city_id?: string;
+  parent_name?: string;
+  canonical_url: string;
+  score?: number;
+  popularity_score?: number;
+};
 
-function groupLabel(k: string): string {
-  if (k === "locations") return "Locations";
-  if (k === "projects") return "Projects";
-  if (k === "builders") return "Builders";
-  if (k === "rate_pages") return "Property Rates";
-  if (k === "property_pdps") return "Properties";
-  return "Other";
+type SearchResponse = {
+  q: string;
+  normalized_q: string;
+  did_you_mean: string | null;
+  groups: {
+    locations: Entity[];
+    projects: Entity[];
+    builders: Entity[];
+    rate_pages: Entity[];
+    property_pdps: Entity[];
+  };
+  fallbacks: {
+    relaxed_used: boolean;
+    trending: Entity[];
+    reason: string | null;
+  };
+};
+
+type ParseResponse = {
+  q: string;
+  intent: string | null;
+  bhk: number | null;
+  locality_hint: string | null;
+  max_price: number | null;
+  max_rent: number | null;
+  currency: string | null;
+  ok: boolean;
+};
+
+function isPromise<T>(v: unknown): v is Promise<T> {
+  return !!v && typeof v === "object" && "then" in v && typeof (v as any).then === "function";
 }
 
-function itemMeta(it: SuggestItem): string {
-  const parts: string[] = [];
-  if (it.entity_type) parts.push(it.entity_type);
-  if (it.city) parts.push(it.city);
-  if (it.parent_name) parts.push(it.parent_name);
-  return parts.join(" • ");
-}
-
-export default function SearchPage() {
-  const sp = useSearchParams();
-  const q = (sp.get("q") || "").trim();
-  const cityId = (sp.get("city_id") || "").trim();
-
-  const [loading, setLoading] = useState(false);
-  const [resp, setResp] = useState<SuggestResponse | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!q) {
-      setResp(null);
-      setErr(null);
-      return;
-    }
-
-    let cancelled = false;
-    setLoading(true);
-    setErr(null);
-
-    searchApi(q, cityId || undefined, 50)
-      .then((r) => {
-        if (cancelled) return;
-        setResp(r);
-      })
-      .catch((e: any) => {
-        if (cancelled) return;
-        setErr(e?.message || "Search failed");
-        setResp(null);
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [q, cityId]);
-
-  const total = useMemo(() => {
-    if (!resp) return 0;
-    return (
-      resp.groups.locations.length +
-      resp.groups.projects.length +
-      resp.groups.builders.length +
-      resp.groups.rate_pages.length +
-      resp.groups.property_pdps.length
-    );
-  }, [resp]);
+function Section({ title, items }: { title: string; items: Entity[] }) {
+  if (!items?.length) return null;
 
   return (
-    <div style={{ minHeight: "100vh", padding: "56px 16px", display: "flex", justifyContent: "center" }}>
-      <div style={{ width: "100%", maxWidth: 860 }}>
-        <div style={{ marginBottom: 14 }}>
-          <SearchBar initialQuery={q} initialCityId={cityId} />
-        </div>
-
-        {!q ? (
-          <div style={{ marginTop: 18, fontSize: 14, opacity: 0.75 }}>
-            Type a query above to search.
-          </div>
-        ) : null}
-
-        {loading ? (
-          <div style={{ marginTop: 18, fontSize: 14, opacity: 0.8 }}>Loading…</div>
-        ) : null}
-
-        {err ? (
-          <div style={{ marginTop: 18, fontSize: 14, color: "crimson" }}>{err}</div>
-        ) : null}
-
-        {resp && !loading ? (
-          <div style={{ marginTop: 18 }}>
-            <div style={{ fontSize: 14, opacity: 0.75, marginBottom: 8 }}>
-              Query: <b>{resp.normalized_q}</b>
+    <section className="mt-6">
+      <h2 className="text-lg font-semibold">{title}</h2>
+      <div className="mt-3 space-y-3">
+        {items.map((e) => (
+          <div key={e.id} className="border border-white/15 rounded-lg p-4 bg-white/5">
+            <div className="font-medium">{e.name}</div>
+            <div className="text-sm opacity-70">
+              {e.entity_type}
+              {e.city ? ` • ${e.city}` : ""}
+              {e.parent_name ? ` • ${e.parent_name}` : ""}
             </div>
-            <div style={{ fontSize: 14, opacity: 0.75, marginBottom: 18 }}>
-              Results: <b>{total}</b>
-            </div>
-
-            {resp.did_you_mean ? (
-              <div
-                style={{
-                  padding: "12px 14px",
-                  border: "1px solid rgba(255,255,255,0.14)",
-                  borderRadius: 10,
-                  background: "rgba(255,255,255,0.04)",
-                  marginBottom: 16,
-                  fontSize: 14,
-                }}
-              >
-                Did you mean{" "}
-                <a
-                  href={`/search?q=${encodeURIComponent(resp.did_you_mean)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`}
-                  style={{ color: "#8ab4ff", textDecoration: "none", fontWeight: 750 }}
-                >
-                  {resp.did_you_mean}
-                </a>
-                ?
-              </div>
-            ) : null}
-
-            {total === 0 ? (
-              <div
-                style={{
-                  padding: "14px",
-                  border: "1px solid rgba(255,255,255,0.14)",
-                  borderRadius: 10,
-                  background: "rgba(255,255,255,0.04)",
-                }}
-              >
-                <div style={{ fontSize: 16, fontWeight: 850 }}>No results found</div>
-                <div style={{ fontSize: 13, opacity: 0.75, marginTop: 4 }}>
-                  {resp.fallbacks?.relaxed_used
-                    ? `Tried relaxed matching. Reason: ${resp.fallbacks.reason || "no_results"}`
-                    : "Try a different spelling or explore trending."}
-                </div>
-
-                {resp.fallbacks?.trending?.length ? (
-                  <div style={{ marginTop: 14 }}>
-                    <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 10 }}>Trending</div>
-                    <div style={{ display: "grid", gap: 10 }}>
-                      {resp.fallbacks.trending.map((t) => (
-                        <a
-                          key={t.id}
-                          href={`/go?url=${encodeURIComponent(t.canonical_url)}&q=${encodeURIComponent(t.name)}`}
-                          style={{
-                            display: "block",
-                            padding: "12px",
-                            borderRadius: 12,
-                            border: "1px solid rgba(255,255,255,0.14)",
-                            background: "rgba(0,0,0,0.12)",
-                            textDecoration: "none",
-                            color: "inherit",
-                          }}
-                        >
-                          <div style={{ fontSize: 14, fontWeight: 800 }}>{t.name}</div>
-                          <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>{itemMeta(t)}</div>
-                        </a>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div style={{ display: "grid", gap: 18 }}>
-                {Object.entries(resp.groups).map(([k, arr]) => {
-                  if (!arr.length) return null;
-                  return (
-                    <div key={k}>
-                      <div style={{ fontSize: 16, fontWeight: 900, marginBottom: 10 }}>{groupLabel(k)}</div>
-                      <div style={{ display: "grid", gap: 10 }}>
-                        {arr.map((it) => (
-                          <a
-                            key={it.id}
-                            href={`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(it.name)}`}
-                            style={{
-                              display: "block",
-                              padding: "14px",
-                              borderRadius: 12,
-                              border: "1px solid rgba(255,255,255,0.14)",
-                              background: "rgba(0,0,0,0.12)",
-                              textDecoration: "none",
-                              color: "inherit",
-                            }}
-                          >
-                            <div style={{ fontSize: 14, fontWeight: 850 }}>{it.name}</div>
-                            <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>{itemMeta(it)}</div>
-                            <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-                              URL: <span style={{ opacity: 0.9 }}>{it.canonical_url}</span>
-                            </div>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+            <div className="text-sm mt-2 opacity-80">URL: {e.canonical_url}</div>
           </div>
-        ) : null}
+        ))}
       </div>
-    </div>
+    </section>
+  );
+}
+
+export default async function SearchPage({
+  searchParams,
+}: {
+  // Next 16 may pass this as a Promise
+  searchParams:
+    | Promise<{ q?: string; city_id?: string }>
+    | { q?: string; city_id?: string };
+}) {
+  const sp = isPromise<{ q?: string; city_id?: string }>(searchParams)
+    ? await searchParams
+    : searchParams;
+
+  const q = (sp.q || "").trim();
+  const city_id = (sp.city_id || "").trim();
+
+  if (!q) {
+    return (
+      <main className="min-h-screen bg-[#0b0c0f] text-white">
+        <div className="max-w-5xl mx-auto px-6 pt-10">
+          <div className="opacity-70">Missing q</div>
+        </div>
+      </main>
+    );
+  }
+
+  const [search, parse] = await Promise.all([
+    apiGet<SearchResponse>("/api/v1/search", { q, city_id: city_id || null }),
+    apiGet<ParseResponse>("/api/v1/search/parse", { q }),
+  ]);
+
+  const total =
+    (search.groups.locations?.length || 0) +
+    (search.groups.projects?.length || 0) +
+    (search.groups.builders?.length || 0) +
+    (search.groups.rate_pages?.length || 0) +
+    (search.groups.property_pdps?.length || 0);
+
+  const chips: string[] = [];
+  if (parse?.ok) {
+    if (parse.bhk) chips.push(`${parse.bhk} BHK`);
+    if (parse.locality_hint) chips.push(`Locality: ${parse.locality_hint}`);
+    if (parse.max_price) chips.push(`Max Price: ₹${parse.max_price.toLocaleString("en-IN")}`);
+    if (parse.max_rent) chips.push(`Max Rent: ₹${parse.max_rent.toLocaleString("en-IN")}`);
+  }
+
+  return (
+    <main className="min-h-screen bg-[#0b0c0f] text-white">
+      <div className="max-w-5xl mx-auto px-6 pt-10">
+        <div className="opacity-80">
+          Query: <span className="font-semibold">{q}</span>
+        </div>
+        <div className="opacity-70 mt-1">Results: {total}</div>
+
+        {search.did_you_mean && (
+          <div className="mt-3 opacity-90">
+            Did you mean: <span className="underline">{search.did_you_mean}</span>
+          </div>
+        )}
+
+        {chips.length > 0 && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {chips.map((c) => (
+              <span key={c} className="text-xs px-2 py-1 rounded-md bg-white/10 border border-white/15">
+                {c}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {total === 0 ? (
+          <div className="mt-8">
+            <div className="text-xl font-semibold">No results found</div>
+            <div className="opacity-70 mt-1">
+              {search.fallbacks?.relaxed_used ? `Tried relaxed matching. Reason: ${search.fallbacks.reason}` : ""}
+            </div>
+
+            {search.fallbacks?.trending?.length ? (
+              <section className="mt-6">
+                <h2 className="text-lg font-semibold">Trending</h2>
+                <div className="mt-3 space-y-3">
+                  {search.fallbacks.trending.map((e) => (
+                    <div key={e.id} className="border border-white/15 rounded-lg p-4 bg-white/5">
+                      <div className="font-medium">{e.name}</div>
+                      <div className="text-sm opacity-70">{e.entity_type}</div>
+                      <div className="text-sm mt-2 opacity-80">URL: {e.canonical_url}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            <Section title="Locations" items={search.groups.locations} />
+            <Section title="Projects" items={search.groups.projects} />
+            <Section title="Builders" items={search.groups.builders} />
+            <Section title="Property Rates" items={search.groups.rate_pages} />
+            <Section title="Properties" items={search.groups.property_pdps} />
+          </>
+        )}
+      </div>
+    </main>
   );
 }
