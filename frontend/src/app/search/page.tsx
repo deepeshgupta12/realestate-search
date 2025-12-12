@@ -1,175 +1,137 @@
-// frontend/src/app/search/page.tsx
+import Link from "next/link";
+import SearchBar from "@/components/SearchBar";
 import { apiGet } from "@/lib/api";
+import type { SearchResponse, SearchEntity } from "@/lib/types";
 
-type Entity = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
-  canonical_url: string;
-  score?: number;
-  popularity_score?: number;
+type SearchParamsShape = { q?: string; city_id?: string };
+type Props = {
+  searchParams: Promise<SearchParamsShape> | SearchParamsShape;
 };
 
-type SearchResponse = {
+function Section({
+  title,
+  items,
+  q,
+}: {
+  title: string;
+  items: SearchEntity[];
   q: string;
-  normalized_q: string;
-  did_you_mean: string | null;
-  groups: {
-    locations: Entity[];
-    projects: Entity[];
-    builders: Entity[];
-    rate_pages: Entity[];
-    property_pdps: Entity[];
-  };
-  fallbacks: {
-    relaxed_used: boolean;
-    trending: Entity[];
-    reason: string | null;
-  };
-};
-
-type ParseResponse = {
-  q: string;
-  intent: string | null;
-  bhk: number | null;
-  locality_hint: string | null;
-  max_price: number | null;
-  max_rent: number | null;
-  currency: string | null;
-  ok: boolean;
-};
-
-function isPromise<T>(v: unknown): v is Promise<T> {
-  return !!v && typeof v === "object" && "then" in v && typeof (v as any).then === "function";
-}
-
-function Section({ title, items }: { title: string; items: Entity[] }) {
+}) {
   if (!items?.length) return null;
 
   return (
-    <section className="mt-6">
-      <h2 className="text-lg font-semibold">{title}</h2>
-      <div className="mt-3 space-y-3">
-        {items.map((e) => (
-          <div key={e.id} className="border border-white/15 rounded-lg p-4 bg-white/5">
-            <div className="font-medium">{e.name}</div>
-            <div className="text-sm opacity-70">
-              {e.entity_type}
-              {e.city ? ` • ${e.city}` : ""}
-              {e.parent_name ? ` • ${e.parent_name}` : ""}
+    <div style={{ marginTop: 18 }}>
+      <h3 style={{ margin: "0 0 10px 0" }}>{title}</h3>
+      <div style={{ display: "grid", gap: 12 }}>
+        {items.map((it) => (
+          <div
+            key={`${it.entity_type}:${it.id}`}
+            style={{
+              border: "1px solid rgba(255,255,255,0.18)",
+              borderRadius: 10,
+              padding: 14,
+              background: "rgba(255,255,255,0.03)",
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>{it.name}</div>
+            <div style={{ opacity: 0.75, fontSize: 12, marginTop: 4 }}>
+              {it.entity_type}
+              {it.city ? ` • ${it.city}` : ""}
+              {it.parent_name ? ` • ${it.parent_name}` : ""}
             </div>
-            <div className="text-sm mt-2 opacity-80">URL: {e.canonical_url}</div>
+            <div style={{ marginTop: 10 }}>
+              <Link
+                href={`/go?url=${encodeURIComponent(it.canonical_url)}&q=${encodeURIComponent(
+                  q
+                )}`}
+                style={{ opacity: 0.9 }}
+              >
+                URL: {it.canonical_url}
+              </Link>
+            </div>
           </div>
         ))}
       </div>
-    </section>
+    </div>
   );
 }
 
-export default async function SearchPage({
-  searchParams,
-}: {
-  // Next 16 may pass this as a Promise
-  searchParams:
-    | Promise<{ q?: string; city_id?: string }>
-    | { q?: string; city_id?: string };
-}) {
-  const sp = isPromise<{ q?: string; city_id?: string }>(searchParams)
-    ? await searchParams
-    : searchParams;
+export default async function SearchPage({ searchParams }: Props) {
+  const sp = await Promise.resolve(searchParams as SearchParamsShape);
 
-  const q = (sp.q || "").trim();
-  const city_id = (sp.city_id || "").trim();
+  const q = (sp?.q ?? "").trim();
+  const city_id = (sp?.city_id ?? "").trim();
 
+  // Always show the search bar (even if q is empty)
   if (!q) {
     return (
-      <main className="min-h-screen bg-[#0b0c0f] text-white">
-        <div className="max-w-5xl mx-auto px-6 pt-10">
-          <div className="opacity-70">Missing q</div>
+      <main style={{ maxWidth: 980, margin: "0 auto", padding: "48px 20px" }}>
+        <h1 style={{ marginBottom: 8 }}>Search</h1>
+        <p style={{ opacity: 0.75, marginTop: 0 }}>
+          Type a query to see results.
+        </p>
+        <div style={{ marginTop: 18 }}>
+          <SearchBar />
         </div>
       </main>
     );
   }
 
-  const [search, parse] = await Promise.all([
-    apiGet<SearchResponse>("/api/v1/search", { q, city_id: city_id || null }),
-    apiGet<ParseResponse>("/api/v1/search/parse", { q }),
-  ]);
+  const data = await apiGet<SearchResponse>("/api/v1/search", {
+    q,
+    ...(city_id ? { city_id } : {}),
+  });
 
-  const total =
-    (search.groups.locations?.length || 0) +
-    (search.groups.projects?.length || 0) +
-    (search.groups.builders?.length || 0) +
-    (search.groups.rate_pages?.length || 0) +
-    (search.groups.property_pdps?.length || 0);
-
-  const chips: string[] = [];
-  if (parse?.ok) {
-    if (parse.bhk) chips.push(`${parse.bhk} BHK`);
-    if (parse.locality_hint) chips.push(`Locality: ${parse.locality_hint}`);
-    if (parse.max_price) chips.push(`Max Price: ₹${parse.max_price.toLocaleString("en-IN")}`);
-    if (parse.max_rent) chips.push(`Max Rent: ₹${parse.max_rent.toLocaleString("en-IN")}`);
-  }
+  const groups = data.groups || {
+    locations: [],
+    projects: [],
+    builders: [],
+    rate_pages: [],
+    property_pdps: [],
+  };
 
   return (
-    <main className="min-h-screen bg-[#0b0c0f] text-white">
-      <div className="max-w-5xl mx-auto px-6 pt-10">
-        <div className="opacity-80">
-          Query: <span className="font-semibold">{q}</span>
-        </div>
-        <div className="opacity-70 mt-1">Results: {total}</div>
-
-        {search.did_you_mean && (
-          <div className="mt-3 opacity-90">
-            Did you mean: <span className="underline">{search.did_you_mean}</span>
-          </div>
-        )}
-
-        {chips.length > 0 && (
-          <div className="mt-4 flex flex-wrap gap-2">
-            {chips.map((c) => (
-              <span key={c} className="text-xs px-2 py-1 rounded-md bg-white/10 border border-white/15">
-                {c}
-              </span>
-            ))}
-          </div>
-        )}
-
-        {total === 0 ? (
-          <div className="mt-8">
-            <div className="text-xl font-semibold">No results found</div>
-            <div className="opacity-70 mt-1">
-              {search.fallbacks?.relaxed_used ? `Tried relaxed matching. Reason: ${search.fallbacks.reason}` : ""}
-            </div>
-
-            {search.fallbacks?.trending?.length ? (
-              <section className="mt-6">
-                <h2 className="text-lg font-semibold">Trending</h2>
-                <div className="mt-3 space-y-3">
-                  {search.fallbacks.trending.map((e) => (
-                    <div key={e.id} className="border border-white/15 rounded-lg p-4 bg-white/5">
-                      <div className="font-medium">{e.name}</div>
-                      <div className="text-sm opacity-70">{e.entity_type}</div>
-                      <div className="text-sm mt-2 opacity-80">URL: {e.canonical_url}</div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            ) : null}
-          </div>
-        ) : (
-          <>
-            <Section title="Locations" items={search.groups.locations} />
-            <Section title="Projects" items={search.groups.projects} />
-            <Section title="Builders" items={search.groups.builders} />
-            <Section title="Property Rates" items={search.groups.rate_pages} />
-            <Section title="Properties" items={search.groups.property_pdps} />
-          </>
-        )}
+    <main style={{ maxWidth: 980, margin: "0 auto", padding: "48px 20px" }}>
+      <div style={{ marginBottom: 18 }}>
+        <SearchBar initialQuery={q} initialCityId={city_id} />
       </div>
+
+      <div style={{ opacity: 0.75, marginBottom: 10 }}>
+        Query: <b>{data.q}</b>
+      </div>
+
+      {data.did_you_mean ? (
+        <div style={{ marginBottom: 16 }}>
+          Did you mean{" "}
+          <Link href={`/search?q=${encodeURIComponent(data.did_you_mean)}`}>
+            {data.did_you_mean}
+          </Link>
+          ?
+        </div>
+      ) : null}
+
+      <div style={{ opacity: 0.8, marginBottom: 18 }}>
+        Results:{" "}
+        {[
+          groups.locations?.length || 0,
+          groups.projects?.length || 0,
+          groups.builders?.length || 0,
+          groups.rate_pages?.length || 0,
+          groups.property_pdps?.length || 0,
+        ].reduce((a, b) => a + b, 0)}
+      </div>
+
+      <Section title="Locations" items={groups.locations || []} q={q} />
+      <Section title="Projects" items={groups.projects || []} q={q} />
+      <Section title="Builders" items={groups.builders || []} q={q} />
+      <Section title="Property Rates" items={groups.rate_pages || []} q={q} />
+      <Section title="Properties" items={groups.property_pdps || []} q={q} />
+
+      {data.fallbacks?.relaxed_used ? (
+        <div style={{ marginTop: 24, opacity: 0.8 }}>
+          Tried relaxed matching. Reason: {data.fallbacks.reason}
+        </div>
+      ) : null}
     </main>
   );
 }
