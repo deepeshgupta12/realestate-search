@@ -19,29 +19,6 @@ const CITY_OPTIONS = [
 
 type RecentItem = { q: string; cityId: string; ts: number };
 
-function flattenGroups(r: SuggestResponse | null): SuggestItem[] {
-  if (!r) return [];
-  return [
-    ...r.groups.locations,
-    ...r.groups.projects,
-    ...r.groups.builders,
-    ...r.groups.rate_pages,
-    ...r.groups.property_pdps,
-  ];
-}
-
-function groupLabel(entityType: string): string {
-  if (
-    ["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType)
-  )
-    return "Locations";
-  if (entityType === "project") return "Projects";
-  if (entityType === "builder") return "Builders";
-  if (entityType === "rate_page") return "Property Rates";
-  if (entityType === "property_pdp") return "Properties";
-  return "Other";
-}
-
 const LS_KEY = "re_search_recent_v1";
 
 function loadRecents(): RecentItem[] {
@@ -67,6 +44,60 @@ function saveRecent(item: RecentItem) {
   localStorage.setItem(LS_KEY, JSON.stringify(next));
 }
 
+function groupKey(entityType: string): "locations" | "projects" | "builders" | "rate_pages" | "property_pdps" | "other" {
+  if (["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType))
+    return "locations";
+  if (entityType === "project") return "projects";
+  if (entityType === "builder") return "builders";
+  if (entityType === "rate_page") return "rate_pages";
+  if (entityType === "property_pdp") return "property_pdps";
+  return "other";
+}
+
+function groupLabel(k: string): string {
+  if (k === "locations") return "Locations";
+  if (k === "projects") return "Projects";
+  if (k === "builders") return "Builders";
+  if (k === "rate_pages") return "Property Rates";
+  if (k === "property_pdps") return "Properties";
+  return "Other";
+}
+
+function badge(entityType: string): string {
+  if (["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType)) return "LOC";
+  if (entityType === "project") return "PRJ";
+  if (entityType === "builder") return "DEV";
+  if (entityType === "rate_page") return "RATE";
+  if (entityType === "property_pdp") return "PROP";
+  return "ITEM";
+}
+
+function highlight(text: string, q: string): React.ReactNode {
+  const query = q.trim();
+  if (!query) return text;
+
+  const t = text;
+  const lowerT = t.toLowerCase();
+  const lowerQ = query.toLowerCase();
+
+  const idx = lowerT.indexOf(lowerQ);
+  if (idx < 0) return text;
+
+  const before = t.slice(0, idx);
+  const mid = t.slice(idx, idx + query.length);
+  const after = t.slice(idx + query.length);
+
+  return (
+    <>
+      {before}
+      <span style={{ background: "rgba(138,180,255,0.22)", padding: "0 2px", borderRadius: 4 }}>
+        {mid}
+      </span>
+      {after}
+    </>
+  );
+}
+
 export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const router = useRouter();
 
@@ -84,16 +115,38 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
   const lastReq = useRef(0);
 
-  // Anchor for portal dropdown
+  // Portal anchor
   const containerRef = useRef<HTMLDivElement | null>(null);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
   const [anchor, setAnchor] = useState<{ left: number; top: number; width: number } | null>(null);
 
-  const items = useMemo(() => flattenGroups(resp), [resp]);
+  const flatItems = useMemo(() => {
+    if (!resp) return [];
+    return [
+      ...resp.groups.locations,
+      ...resp.groups.projects,
+      ...resp.groups.builders,
+      ...resp.groups.rate_pages,
+      ...resp.groups.property_pdps,
+    ];
+  }, [resp]);
+
+  const grouped = useMemo(() => {
+    const g: Record<string, SuggestItem[]> = {
+      locations: [],
+      projects: [],
+      builders: [],
+      rate_pages: [],
+      property_pdps: [],
+      other: [],
+    };
+    for (const it of flatItems) g[groupKey(it.entity_type)].push(it);
+    return g;
+  }, [flatItems]);
 
   const hasAnySuggestions = useMemo(() => {
-    return items.length > 0 || Boolean(resp?.did_you_mean);
-  }, [items.length, resp?.did_you_mean]);
+    return flatItems.length > 0 || Boolean(resp?.did_you_mean);
+  }, [flatItems.length, resp?.did_you_mean]);
 
   const showNoResultsWhileTyping = useMemo(() => {
     return q.trim().length > 0 && !hasAnySuggestions;
@@ -235,6 +288,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     }
   }
 
+  // Keyboard nav is flat across sections for simplicity
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!open) {
       if (e.key === "Enter") submitRawQuery(q);
@@ -243,13 +297,13 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIdx((v) => Math.min(v + 1, items.length - 1));
+      setActiveIdx((v) => Math.min(v + 1, flatItems.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setActiveIdx((v) => Math.max(v - 1, -1));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const selected = activeIdx >= 0 ? items[activeIdx] : null;
+      const selected = activeIdx >= 0 ? flatItems[activeIdx] : null;
       if (selected?.canonical_url) {
         goToUrl(selected.canonical_url, selected.name);
       } else {
@@ -259,6 +313,50 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
       setOpen(false);
       setActiveIdx(-1);
     }
+  }
+
+  function renderItem(it: SuggestItem, idxFlat: number) {
+    return (
+      <div
+        key={it.id}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => (it.canonical_url ? goToUrl(it.canonical_url, it.name) : submitRawQuery(it.name))}
+        style={{
+          padding: "10px 12px",
+          cursor: "pointer",
+          background: idxFlat === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
+          borderBottom: "1px solid rgba(255,255,255,0.06)",
+          display: "flex",
+          gap: 10,
+          alignItems: "flex-start",
+        }}
+      >
+        <div
+          style={{
+            minWidth: 44,
+            textAlign: "center",
+            fontSize: 11,
+            fontWeight: 800,
+            padding: "5px 6px",
+            borderRadius: 8,
+            background: "rgba(255,255,255,0.08)",
+            border: "1px solid rgba(255,255,255,0.10)",
+            lineHeight: "12px",
+          }}
+        >
+          {badge(it.entity_type)}
+        </div>
+
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 14, fontWeight: 750 }}>{highlight(it.name, q)}</div>
+          <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
+            {it.entity_type}
+            {it.city ? ` • ${it.city}` : ""}
+            {it.parent_name ? ` • ${it.parent_name}` : ""}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const dropdownInner = (
@@ -276,7 +374,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                   onClick={() => submitRawQuery(r.q)}
                   style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                 >
-                  <div style={{ fontSize: 14, fontWeight: 600 }}>{r.q}</div>
+                  <div style={{ fontSize: 14, fontWeight: 650 }}>{r.q}</div>
                   <div style={{ fontSize: 12, opacity: 0.7 }}>
                     {r.cityId ? `City: ${r.cityId}` : "All Cities"}
                   </div>
@@ -297,7 +395,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                   onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
                   style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                 >
-                  <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                  <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
                   <div style={{ fontSize: 12, opacity: 0.7 }}>
                     {t.entity_type}
                     {t.city ? ` • ${t.city}` : ""}
@@ -324,34 +422,40 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
             </div>
           ) : null}
 
-          {items.length > 0 ? (
+          {flatItems.length > 0 ? (
             <div>
-              {items.map((it, idx) => (
-                <div
-                  key={it.id}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => (it.canonical_url ? goToUrl(it.canonical_url, it.name) : submitRawQuery(it.name))}
-                  style={{
-                    padding: "10px 12px",
-                    cursor: "pointer",
-                    background: idx === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
-                    borderBottom: "1px solid rgba(255,255,255,0.06)",
-                  }}
-                >
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>{it.name}</div>
-                  <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
-                    {groupLabel(it.entity_type)}
-                    {it.city ? ` • ${it.city}` : ""}
-                    {it.parent_name ? ` • ${it.parent_name}` : ""}
+              {Object.entries(grouped).map(([k, arr]) => {
+                if (!arr || arr.length === 0 || k === "other") return null;
+
+                // Render section header + items
+                // Need idxFlat mapping for keyboard highlight: compute by scanning flatItems
+                return (
+                  <div key={k}>
+                    <div
+                      style={{
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        fontWeight: 800,
+                        opacity: 0.8,
+                        borderTop: "1px solid rgba(255,255,255,0.10)",
+                        background: "rgba(255,255,255,0.03)",
+                      }}
+                    >
+                      {groupLabel(k)}
+                    </div>
+                    {arr.map((it) => {
+                      const idxFlat = flatItems.findIndex((x) => x.id === it.id);
+                      return renderItem(it, idxFlat);
+                    })}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div style={{ padding: "12px" }}>
               {showNoResultsWhileTyping ? (
                 <>
-                  <div style={{ fontSize: 14, fontWeight: 800 }}>No results found</div>
+                  <div style={{ fontSize: 14, fontWeight: 850 }}>No results found</div>
                   <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
                     Try a different spelling or choose from trending.
                   </div>
@@ -366,7 +470,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                           onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
                           style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                         >
-                          <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                          <div style={{ fontSize: 14, fontWeight: 650 }}>{t.name}</div>
                           <div style={{ fontSize: 12, opacity: 0.7 }}>
                             {t.entity_type}
                             {t.city ? ` • ${t.city}` : ""}
@@ -457,7 +561,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                 background: "rgba(20,20,24,0.98)",
                 boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
                 overflowY: "auto",
-                maxHeight: "min(520px, calc(100vh - 140px))",
+                maxHeight: "min(560px, calc(100vh - 140px))",
                 overscrollBehavior: "contain",
                 zIndex: 9999,
               }}
