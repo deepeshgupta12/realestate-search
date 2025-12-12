@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { resolve, suggest, trending } from "@/lib/api";
 import type { SuggestItem, SuggestResponse } from "@/lib/types";
@@ -30,7 +31,10 @@ function flattenGroups(r: SuggestResponse | null): SuggestItem[] {
 }
 
 function groupLabel(entityType: string): string {
-  if (["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType)) return "Locations";
+  if (
+    ["city", "micromarket", "locality", "listing_page", "locality_overview"].includes(entityType)
+  )
+    return "Locations";
   if (entityType === "project") return "Projects";
   if (entityType === "builder") return "Builders";
   if (entityType === "rate_page") return "Property Rates";
@@ -56,34 +60,96 @@ function saveRecent(item: RecentItem) {
   const recents = loadRecents();
   const next = [
     item,
-    ...recents.filter((r) => !(r.q.toLowerCase() === item.q.toLowerCase() && r.cityId === item.cityId)),
+    ...recents.filter(
+      (r) => !(r.q.toLowerCase() === item.q.toLowerCase() && r.cityId === item.cityId)
+    ),
   ].slice(0, 8);
   localStorage.setItem(LS_KEY, JSON.stringify(next));
 }
 
 export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const router = useRouter();
+
   const [q, setQ] = useState(initialQuery || "");
   const [cityId, setCityId] = useState(initialCityId || "");
+
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState<SuggestResponse | null>(null);
   const [open, setOpen] = useState(false);
   const [activeIdx, setActiveIdx] = useState(-1);
   const [error, setError] = useState<string | null>(null);
 
-  const [trend, setTrend] = useState<unknown[]>([]);
+  const [trend, setTrend] = useState<any[]>([]);
   const [recents, setRecents] = useState<RecentItem[]>([]);
 
   const lastReq = useRef(0);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Anchor for portal dropdown
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
+  const [anchor, setAnchor] = useState<{ left: number; top: number; width: number } | null>(null);
 
   const items = useMemo(() => flattenGroups(resp), [resp]);
-  const hasAnySuggestions = items.length > 0 || Boolean(resp?.did_you_mean);
+
+  const hasAnySuggestions = useMemo(() => {
+    return items.length > 0 || Boolean(resp?.did_you_mean);
+  }, [items.length, resp?.did_you_mean]);
+
+  const showNoResultsWhileTyping = useMemo(() => {
+    return q.trim().length > 0 && !hasAnySuggestions;
+  }, [q, hasAnySuggestions]);
 
   // Load recents once
   useEffect(() => {
-    setRecents(typeof window !== "undefined" ? loadRecents() : []);
+    if (typeof window === "undefined") return;
+    setRecents(loadRecents());
   }, []);
+
+  // Compute portal position when open
+  useEffect(() => {
+    if (!open) return;
+
+    const update = () => {
+      const el = containerRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      setAnchor({
+        left: rect.left,
+        top: rect.bottom + 6,
+        width: rect.width,
+      });
+    };
+
+    update();
+
+    window.addEventListener("resize", update);
+    // capture scroll inside nested containers too
+    window.addEventListener("scroll", update, true);
+
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [open]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!open) return;
+
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      const inContainer = containerRef.current?.contains(t);
+      const inDropdown = dropdownRef.current?.contains(t);
+      if (!inContainer && !inDropdown) {
+        setOpen(false);
+        setActiveIdx(-1);
+      }
+    };
+
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
 
   // Fetch trending (city-scoped) when dropdown opens or city changes
   useEffect(() => {
@@ -138,9 +204,11 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     try {
       const r = await resolve(queryTrim, cityId || undefined);
 
-      // persist recents
-      saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
-      setRecents(loadRecents());
+      // Save recents
+      if (typeof window !== "undefined") {
+        saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
+        setRecents(loadRecents());
+      }
 
       if (r.action === "redirect") {
         router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(queryTrim)}`);
@@ -150,11 +218,12 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
       const params = new URLSearchParams({ q: queryTrim });
       if (cityId) params.set("city_id", cityId);
       router.push(`/search?${params.toString()}`);
-    } catch (e: unknown) {
+    } catch (e: any) {
       setError(e.message || "Resolve failed");
     } finally {
       setLoading(false);
       setOpen(false);
+      setActiveIdx(-1);
     }
   }
 
@@ -180,16 +249,141 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     }
   }
 
-  function pick(item: { name: string }) {
-    setQ(item.name);
+  function pickName(name: string) {
+    setQ(name);
     setOpen(false);
-    submit(item.name);
+    setActiveIdx(-1);
+    submit(name);
   }
 
-  const showNoResultsWhileTyping = q.trim().length > 0 && !hasAnySuggestions;
+  const dropdownInner = (
+    <div>
+      {/* Empty query: show Recents + Trending */}
+      {q.trim().length === 0 ? (
+        <div>
+          {recents.length > 0 ? (
+            <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)" }}>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Recent searches</div>
+              {recents.map((r) => (
+                <div
+                  key={`${r.q}-${r.cityId}-${r.ts}`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pickName(r.q)}
+                  style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                >
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>{r.q}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>
+                    {r.cityId ? `City: ${r.cityId}` : "All Cities"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <div style={{ padding: "10px 12px" }}>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
+            {trend.length === 0 ? (
+              <div style={{ fontSize: 14, opacity: 0.7 }}>No trending items</div>
+            ) : (
+              trend.slice(0, 10).map((t: any) => (
+                <div
+                  key={t.id}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pickName(t.name)}
+                  style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                >
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7 }}>
+                    {t.entity_type}
+                    {t.city ? ` • ${t.city}` : ""}
+                    {t.parent_name ? ` • ${t.parent_name}` : ""}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      ) : (
+        <div>
+          {/* Non-empty query */}
+          {resp?.did_you_mean ? (
+            <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
+              Did you mean{" "}
+              <button
+                onClick={() => submit(resp.did_you_mean!)}
+                style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
+              >
+                {resp.did_you_mean}
+              </button>
+              ?
+            </div>
+          ) : null}
+
+          {items.length > 0 ? (
+            <div>
+              {items.map((it, idx) => (
+                <div
+                  key={it.id}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pickName(it.name)}
+                  style={{
+                    padding: "10px 12px",
+                    cursor: "pointer",
+                    background: idx === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
+                    borderBottom: "1px solid rgba(255,255,255,0.06)",
+                  }}
+                >
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>{it.name}</div>
+                  <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
+                    {groupLabel(it.entity_type)}
+                    {it.city ? ` • ${it.city}` : ""}
+                    {it.parent_name ? ` • ${it.parent_name}` : ""}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ padding: "12px" }}>
+              {showNoResultsWhileTyping ? (
+                <>
+                  <div style={{ fontSize: 14, fontWeight: 800 }}>No results found</div>
+                  <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                    Try a different spelling or choose from trending.
+                  </div>
+
+                  {trend.length > 0 ? (
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
+                      {trend.slice(0, 10).map((t: any) => (
+                        <div
+                          key={t.id}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => pickName(t.name)}
+                          style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
+                        >
+                          <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
+                          <div style={{ fontSize: 12, opacity: 0.7 }}>
+                            {t.entity_type}
+                            {t.city ? ` • ${t.city}` : ""}
+                            {t.parent_name ? ` • ${t.parent_name}` : ""}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 
   return (
-    <div style={{ maxWidth: 760, width: "100%", position: "relative" }}>
+    <div ref={containerRef} style={{ maxWidth: 760, width: "100%" }}>
       <div style={{ display: "flex", gap: 8 }}>
         <select
           value={cityId}
@@ -210,7 +404,6 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
         </select>
 
         <input
-          ref={inputRef}
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={onKeyDown}
@@ -244,146 +437,31 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
       {error ? <div style={{ marginTop: 8, color: "crimson", fontSize: 14 }}>{error}</div> : null}
 
-      {open ? (
-        <div
-          onWheelCapture={(e) => e.stopPropagation()}
-          style={{
-            position: "absolute",
-            top: 46,
-            left: 0,
-            right: 0,
-            border: "1px solid rgba(255,255,255,0.18)",
-            borderRadius: 10,
-            background: "rgba(20,20,24,0.98)",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
-            overflowY: "auto",
-            maxHeight: "min(520px, calc(100vh - 140px))",
-            overscrollBehavior: "contain",
-            zIndex: 50,
-          }}
-        >
-          {/* Empty query: show Recents + Trending */}
-          {q.trim().length === 0 ? (
-            <div>
-              {recents.length > 0 ? (
-                <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)" }}>
-                  <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Recent searches</div>
-                  {recents.map((r) => (
-                    <div
-                      key={`${r.q}-${r.cityId}-${r.ts}`}
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => pick({ name: r.q })}
-                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                    >
-                      <div style={{ fontSize: 14, fontWeight: 600 }}>{r.q}</div>
-                      <div style={{ fontSize: 12, opacity: 0.7 }}>{r.cityId ? `City: ${r.cityId}` : "All Cities"}</div>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              <div style={{ padding: "10px 12px" }}>
-                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
-                {trend.length === 0 ? (
-                  <div style={{ fontSize: 14, opacity: 0.7 }}>No trending items</div>
-                ) : (
-                  trend.slice(0, 8).map((t: any) => (
-                    <div
-                      key={t.id}
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => pick({ name: t.name })}
-                      style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                    >
-                      <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
-                      <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        {t.entity_type}
-                        {t.city ? ` • ${t.city}` : ""}
-                        {t.parent_name ? ` • ${t.parent_name}` : ""}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          ) : (
-            <div>
-              {/* Non-empty query */}
-              {resp?.did_you_mean ? (
-                <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
-                  Did you mean{" "}
-                  <button
-                    onClick={() => submit(resp.did_you_mean!)}
-                    style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
-                  >
-                    {resp.did_you_mean}
-                  </button>
-                  ?
-                </div>
-              ) : null}
-
-              {items.length > 0 ? (
-                <div>
-                  {items.map((it, idx) => (
-                    <div
-                      key={it.id}
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => pick(it)}
-                      style={{
-                        padding: "10px 12px",
-                        cursor: "pointer",
-                        background: idx === activeIdx ? "rgba(138,180,255,0.14)" : "transparent",
-                        borderBottom: "1px solid rgba(255,255,255,0.06)",
-                      }}
-                    >
-                      <div style={{ fontSize: 14, fontWeight: 700 }}>{it.name}</div>
-                      <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
-                        {groupLabel(it.entity_type)}
-                        {it.city ? ` • ${it.city}` : ""}
-                        {it.parent_name ? ` • ${it.parent_name}` : ""}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ padding: "12px" }}>
-                  {/* This is the main change you asked for */}
-                  {showNoResultsWhileTyping ? (
-                    <>
-                      <div style={{ fontSize: 14, fontWeight: 800 }}>No results found</div>
-                      <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
-                        Try a different spelling or choose from trending.
-                      </div>
-
-                      {trend.length > 0 ? (
-                        <div style={{ marginTop: 12 }}>
-                          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>Trending</div>
-                          {trend.slice(0, 6).map((t: any) => (
-                            <div
-                              key={t.id}
-                              onMouseDown={(e) => e.preventDefault()}
-                              onClick={() => pick({ name: t.name })}
-                              style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
-                            >
-                              <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
-                              <div style={{ fontSize: 12, opacity: 0.7 }}>
-                                {t.entity_type}
-                                {t.city ? ` • ${t.city}` : ""}
-                                {t.parent_name ? ` • ${t.parent_name}` : ""}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </>
-                  ) : (
-                    <div style={{ fontSize: 14, opacity: 0.75 }}>No suggestions</div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      ) : null}
+      {open && anchor && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              ref={dropdownRef}
+              onWheelCapture={(e) => e.stopPropagation()}
+              style={{
+                position: "fixed",
+                top: anchor.top,
+                left: anchor.left,
+                width: anchor.width,
+                border: "1px solid rgba(255,255,255,0.18)",
+                borderRadius: 10,
+                background: "rgba(20,20,24,0.98)",
+                boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+                overflowY: "auto",
+                maxHeight: "min(520px, calc(100vh - 140px))",
+                overscrollBehavior: "contain",
+                zIndex: 9999,
+              }}
+            >
+              {dropdownInner}
+            </div>,
+            document.body
+          )
+        : null}
     </div>
   );
 }
