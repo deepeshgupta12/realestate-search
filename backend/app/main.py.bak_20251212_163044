@@ -3,13 +3,12 @@ from __future__ import annotations
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
 
 from fastapi import FastAPI, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import NotFoundError  # noqa: F401
+from elasticsearch.exceptions import NotFoundError
 
 # -----------------------
 # Config
@@ -358,13 +357,6 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(q: str, city_id: Optional[str]) -> str:
-    base = f"/search?q={quote_plus(q)}"
-    if city_id:
-        base += f"&city_id={quote_plus(city_id)}"
-    return base
-
-
 # -----------------------
 # App + Routers
 # -----------------------
@@ -480,27 +472,22 @@ def suggest(
 
 
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(
-    q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-):
-    # if query has constraints -> send to SERP (and ALWAYS include url)
+def resolve(q: str):
+    # if query has constraints -> send to SERP
     if is_constraint_heavy(q):
         return ResolveResponse(
             action="serp",
             query=q,
             normalized_query=q,
-            url=build_serp_url(q, city_id),
             reason="constraint_heavy",
         )
 
-    hits, _ = es_search_entities(q=q, limit=5, city_id=city_id)
+    hits, _ = es_search_entities(q=q, limit=5, city_id=None)
     if not hits:
         return ResolveResponse(
             action="serp",
             query=q,
             normalized_query=q,
-            url=build_serp_url(q, city_id),
             reason="no_results",
         )
 
@@ -526,7 +513,6 @@ def resolve(
         action="serp",
         query=q,
         normalized_query=q,
-        url=build_serp_url(q, city_id),
         reason="ambiguous",
         debug={"top_score": top_score, "second_score": second_score, "gap": gap},
     )
