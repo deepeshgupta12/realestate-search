@@ -25,7 +25,7 @@ ABOVE_RE = re.compile(r"\b(above|over|>=|more than)\b", re.IGNORECASE)
 
 PROPERTY_TYPE_MAP = {
     "apartment": ["apartment", "flat"],
-    "builder_floor": ["builder floor", "floor"],
+    "builder_floor": ["builder floor", "builder-floor", "floor"],
     "plot": ["plot", "land"],
     "villa": ["villa", "independent house", "house"],
     "office": ["office", "office space"],
@@ -43,13 +43,10 @@ def _parse_budget(q: str) -> Dict[str, Optional[float]]:
     if not matches:
         return {"min": None, "max": None}
 
-    # pick the last mentioned budget-like number (usually most relevant)
     m = matches[-1]
     amt = float(m.group("amount"))
     unit = (m.group("unit") or "").lower()
 
-    # convert to INR absolute number (rough)
-    # 1 Cr = 1e7, 1 Lakh = 1e5, 1K = 1e3
     if unit in ("cr", "crore"):
         value = amt * 1e7
     elif unit in ("l", "lac", "lakh"):
@@ -57,17 +54,14 @@ def _parse_budget(q: str) -> Dict[str, Optional[float]]:
     elif unit == "k":
         value = amt * 1e3
     else:
-        # if no unit, treat as "lakhs" only if small; else treat as absolute
         value = amt * 1e5 if amt <= 200 else amt
 
-    # determine direction based on nearby keywords
     window = ql[max(0, m.start() - 20) : min(len(ql), m.end() + 20)]
     if UNDER_RE.search(window) and not ABOVE_RE.search(window):
         return {"min": None, "max": value}
     if ABOVE_RE.search(window) and not UNDER_RE.search(window):
         return {"min": value, "max": None}
 
-    # if ambiguous, default to max
     return {"min": None, "max": value}
 
 
@@ -106,9 +100,7 @@ def _has_constraints(parsed: Dict[str, Any]) -> bool:
 
 
 @router.get("/parse")
-def parse_query(
-    q: str = Query(..., min_length=1),
-) -> Dict[str, Any]:
+def parse_query(q: str = Query(..., min_length=1)) -> Dict[str, Any]:
     raw = q
     q = _normalize_space(q)
 
@@ -117,17 +109,17 @@ def parse_query(
     intent = _parse_intent(q)
     property_type = _parse_property_type(q)
 
-    tokens: List[str] = []
+    signals: List[str] = []
     if bhk is not None:
-        tokens.append(f"{bhk}bhk")
+        signals.append(f"{bhk}bhk")
     if budget["max"] is not None:
-        tokens.append("budget_max")
+        signals.append("budget_max")
     if budget["min"] is not None:
-        tokens.append("budget_min")
+        signals.append("budget_min")
     if intent:
-        tokens.append(intent)
+        signals.append(intent)
     if property_type:
-        tokens.append(property_type)
+        signals.append(property_type)
 
     parsed = {
         "q": raw,
@@ -136,7 +128,7 @@ def parse_query(
         "bhk": bhk,
         "property_type": property_type,
         "budget": budget,
-        "signals": tokens,
+        "signals": signals,
     }
 
     return {
