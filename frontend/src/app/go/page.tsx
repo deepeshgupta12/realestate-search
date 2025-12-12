@@ -1,35 +1,44 @@
 import Link from "next/link";
 
-// frontend/src/app/go/page.tsx
-function isPromise<T>(v: unknown): v is Promise<T> {
-  return !!v && typeof v === "object" && "then" in v && typeof (v as any).then === "function";
-}
+type SearchParamsShape = { url?: string; q?: string };
+type Props = { searchParams: Promise<SearchParamsShape> | SearchParamsShape };
 
-export default async function GoPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ q?: string; url?: string }> | { q?: string; url?: string };
-}) {
-  const sp = isPromise<{ q?: string; url?: string }>(searchParams) ? await searchParams : searchParams;
-
-  const q = (sp.q || "").trim();
-  const url = (sp.url || "").trim();
+export default async function GoPage({ searchParams }: Props) {
+  const sp = await Promise.resolve(searchParams as SearchParamsShape);
+  const url = (sp?.url ?? "").trim();
+  const q = (sp?.q ?? "").trim();
 
   return (
-    <main className="min-h-screen bg-[#0b0c0f] text-white">
-      <div className="max-w-3xl mx-auto px-6 pt-20">
-        <h1 className="text-3xl font-semibold">Redirect (Demo)</h1>
-        <p className="mt-2 opacity-70">
-          Query <span className="font-semibold">{q}</span> resolved to:
-        </p>
+    <main style={{ maxWidth: 980, margin: "0 auto", padding: "48px 20px" }}>
+      <h1 style={{ marginBottom: 8 }}>Redirect (Demo)</h1>
 
-        <div className="mt-6 border border-white/15 rounded-lg p-4 bg-white/5">
-          <div className="font-mono">{url || "(missing url)"}</div>
+      {q ? (
+        <div style={{ opacity: 0.75, marginBottom: 18 }}>
+          Query <b>{q}</b> resolved to:
         </div>
+      ) : null}
 
-        <Link className="inline-block mt-6 underline opacity-80" href="/">
-          Back to Home
-        </Link>
+      {url ? (
+        <div
+          style={{
+            border: "1px solid rgba(255,255,255,0.18)",
+            borderRadius: 10,
+            padding: 14,
+            background: "rgba(255,255,255,0.03)",
+          }}
+        >
+          <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+            {url}
+          </div>
+        </div>
+      ) : (
+        <div style={{ opacity: 0.75 }}>
+          Missing <code>url</code> param.
+        </div>
+      )}
+
+      <div style={{ marginTop: 18 }}>
+        <Link href="/">Back to Home</Link>
       </div>
     </main>
   );
