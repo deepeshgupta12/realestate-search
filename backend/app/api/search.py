@@ -3,6 +3,7 @@ from fastapi import APIRouter, Query
 
 from app.search.suggest_service import suggest
 from app.search.resolve_service import resolve
+from app.search.search_service import search
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -22,3 +23,12 @@ def search_resolve(
     context_url: Optional[str] = None,
 ):
     return resolve(q=q, city_id=city_id, context_url=context_url)
+
+@router.get("")
+def search_serp(
+    q: str = Query(..., min_length=1),
+    city_id: Optional[str] = None,
+    limit: int = Query(20, ge=5, le=50),
+    context_url: Optional[str] = None,
+):
+    return search(q=q, city_id=city_id, limit=limit)
