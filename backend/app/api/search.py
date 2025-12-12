@@ -1,43 +1,63 @@
-from typing import Optional
+from __future__ import annotations
+
+from urllib.parse import quote
+
 from fastapi import APIRouter, Query
 
-from app.search.suggest_service import suggest
-from app.search.resolve_service import resolve
-from app.search.search_service import search
+from app.api.router import (
+    HealthResponse,
+    ResolveResponse,
+    SearchResponse,
+    SuggestResponse,
+)
+from app.search.search_service import SearchService
 
-router = APIRouter(prefix="/search", tags=["search"])
+router = APIRouter()
 
-@router.get("/suggest")
-def search_suggest(
+
+def _default_serp_url(q: str, city_id: str | None) -> str:
+    q_enc = quote(q)
+    if city_id:
+        return f"/search?q={q_enc}&city_id={quote(city_id)}"
+    return f"/search?q={q_enc}"
+
+
+@router.get("/health", response_model=HealthResponse)
+def health():
+    return {"status": "ok"}
+
+
+@router.get("/api/v1/search", response_model=SearchResponse)
+def search(
     q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=25),
-    context_url: Optional[str] = None,
+    city_id: str | None = None,
+    limit: int = 10,
 ):
-    return suggest(q=q, city_id=city_id, limit=limit)
+    svc = SearchService()
+    return svc.search(q=q, city_id=city_id, limit=limit)
 
-@router.get("/resolve")
-def search_resolve(
+
+@router.get("/api/v1/search/suggest", response_model=SuggestResponse)
+def suggest(
     q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-    context_url: Optional[str] = None,
+    city_id: str | None = None,
+    limit: int = 10,
 ):
-    return resolve(q=q, city_id=city_id, context_url=context_url)
+    svc = SearchService()
+    return svc.suggest(q=q, city_id=city_id, limit=limit)
 
-@router.get("")
-def search_serp(
+
+@router.get("/api/v1/search/resolve", response_model=ResolveResponse)
+def resolve(
     q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-    limit: int = Query(20, ge=5, le=50),
-    context_url: Optional[str] = None,
+    city_id: str | None = None,
 ):
-    return search(q=q, city_id=city_id, limit=limit)
+    svc = SearchService()
+    res = svc.resolve(q=q, city_id=city_id)
 
-@router.get("/trending")
-def search_trending(
-    city_id: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=25),
-):
-    # trending is popularity-based fallback suggestions
-    from app.search.search_service import get_trending
-    return {"city_id": city_id, "items": get_trending(city_id, limit)}
+    # Step 2.1 fix:
+    # For constraint-heavy queries we intentionally route to SERP, but url should not be null.
+    if getattr(res, "action", None) == "serp" and not getattr(res, "url", None):
+        res.url = _default_serp_url(q, city_id)
+
+    return res
