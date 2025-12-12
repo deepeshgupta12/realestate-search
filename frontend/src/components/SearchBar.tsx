@@ -71,7 +71,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
   const [activeIdx, setActiveIdx] = useState(-1);
   const [error, setError] = useState<string | null>(null);
 
-  const [trend, setTrend] = useState<any[]>([]);
+  const [trend, setTrend] = useState<unknown[]>([]);
   const [recents, setRecents] = useState<RecentItem[]>([]);
 
   const lastReq = useRef(0);
@@ -150,7 +150,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
       const params = new URLSearchParams({ q: queryTrim });
       if (cityId) params.set("city_id", cityId);
       router.push(`/search?${params.toString()}`);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setError(e.message || "Resolve failed");
     } finally {
       setLoading(false);
@@ -246,6 +246,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
       {open ? (
         <div
+          onWheelCapture={(e) => e.stopPropagation()}
           style={{
             position: "absolute",
             top: 46,
@@ -255,7 +256,9 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
             borderRadius: 10,
             background: "rgba(20,20,24,0.98)",
             boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
-            overflow: "hidden",
+            overflowY: "auto",
+            maxHeight: "min(520px, calc(100vh - 140px))",
+            overscrollBehavior: "contain",
             zIndex: 50,
           }}
         >
