@@ -121,9 +121,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     };
 
     update();
-
     window.addEventListener("resize", update);
-    // capture scroll inside nested containers too
     window.addEventListener("scroll", update, true);
 
     return () => {
@@ -194,7 +192,22 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     return () => clearTimeout(t);
   }, [q, cityId]);
 
-  async function submit(query: string) {
+  function recordRecent(queryText: string) {
+    if (typeof window === "undefined") return;
+    const queryTrim = queryText.trim();
+    if (!queryTrim) return;
+    saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
+    setRecents(loadRecents());
+  }
+
+  function goToUrl(url: string, queryText: string) {
+    recordRecent(queryText);
+    setOpen(false);
+    setActiveIdx(-1);
+    router.push(`/go?url=${encodeURIComponent(url)}&q=${encodeURIComponent(queryText)}`);
+  }
+
+  async function submitRawQuery(query: string) {
     const queryTrim = query.trim();
     if (!queryTrim) return;
 
@@ -203,12 +216,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
     try {
       const r = await resolve(queryTrim, cityId || undefined);
-
-      // Save recents
-      if (typeof window !== "undefined") {
-        saveRecent({ q: queryTrim, cityId: cityId || "", ts: Date.now() });
-        setRecents(loadRecents());
-      }
+      recordRecent(queryTrim);
 
       if (r.action === "redirect") {
         router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(queryTrim)}`);
@@ -229,7 +237,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!open) {
-      if (e.key === "Enter") submit(q);
+      if (e.key === "Enter") submitRawQuery(q);
       return;
     }
 
@@ -242,18 +250,15 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
     } else if (e.key === "Enter") {
       e.preventDefault();
       const selected = activeIdx >= 0 ? items[activeIdx] : null;
-      submit(selected ? selected.name : q);
+      if (selected?.canonical_url) {
+        goToUrl(selected.canonical_url, selected.name);
+      } else {
+        submitRawQuery(q);
+      }
     } else if (e.key === "Escape") {
       setOpen(false);
       setActiveIdx(-1);
     }
-  }
-
-  function pickName(name: string) {
-    setQ(name);
-    setOpen(false);
-    setActiveIdx(-1);
-    submit(name);
   }
 
   const dropdownInner = (
@@ -268,7 +273,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                 <div
                   key={`${r.q}-${r.cityId}-${r.ts}`}
                   onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => pickName(r.q)}
+                  onClick={() => submitRawQuery(r.q)}
                   style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                 >
                   <div style={{ fontSize: 14, fontWeight: 600 }}>{r.q}</div>
@@ -289,7 +294,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                 <div
                   key={t.id}
                   onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => pickName(t.name)}
+                  onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
                   style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                 >
                   <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
@@ -310,7 +315,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
             <div style={{ padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,0.10)", fontSize: 14 }}>
               Did you mean{" "}
               <button
-                onClick={() => submit(resp.did_you_mean!)}
+                onClick={() => submitRawQuery(resp.did_you_mean!)}
                 style={{ border: "none", background: "transparent", color: "#8ab4ff", cursor: "pointer" }}
               >
                 {resp.did_you_mean}
@@ -325,7 +330,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                 <div
                   key={it.id}
                   onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => pickName(it.name)}
+                  onClick={() => (it.canonical_url ? goToUrl(it.canonical_url, it.name) : submitRawQuery(it.name))}
                   style={{
                     padding: "10px 12px",
                     cursor: "pointer",
@@ -358,7 +363,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
                         <div
                           key={t.id}
                           onMouseDown={(e) => e.preventDefault()}
-                          onClick={() => pickName(t.name)}
+                          onClick={() => (t.canonical_url ? goToUrl(t.canonical_url, t.name) : submitRawQuery(t.name))}
                           style={{ padding: "8px 6px", cursor: "pointer", borderRadius: 8 }}
                         >
                           <div style={{ fontSize: 14, fontWeight: 600 }}>{t.name}</div>
@@ -421,7 +426,7 @@ export default function SearchBar({ initialQuery, initialCityId }: Props) {
         />
 
         <button
-          onClick={() => submit(q)}
+          onClick={() => submitRawQuery(q)}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
