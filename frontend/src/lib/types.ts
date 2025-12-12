@@ -1,4 +1,4 @@
-export type SearchEntityType =
+export type EntityType =
   | "city"
   | "micromarket"
   | "locality"
@@ -6,31 +6,42 @@ export type SearchEntityType =
   | "locality_overview"
   | "rate_page"
   | "project"
+  | "builder"
   | "property_pdp"
-  | "builder";
+  | string;
 
 export type SuggestItem = {
   id: string;
-  entity_type: SearchEntityType;
+  entity_type: EntityType;
   name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
+  city: string;
+  city_id: string;
+  parent_name: string;
   canonical_url: string;
   score?: number;
+  popularity_score?: number;
+};
+
+export type SuggestGroups = {
+  locations: SuggestItem[];
+  projects: SuggestItem[];
+  builders: SuggestItem[];
+  rate_pages: SuggestItem[];
+  property_pdps: SuggestItem[];
+};
+
+export type SuggestFallbacks = {
+  relaxed_used: boolean;
+  trending: SuggestItem[];
+  reason: string | null;
 };
 
 export type SuggestResponse = {
   q: string;
   normalized_q: string;
   did_you_mean: string | null;
-  groups: {
-    locations: SuggestItem[];
-    projects: SuggestItem[];
-    builders: SuggestItem[];
-    rate_pages: SuggestItem[];
-    property_pdps: SuggestItem[];
-  };
+  groups: SuggestGroups;
+  fallbacks: SuggestFallbacks;
 };
 
 export type ResolveResponse =
@@ -40,46 +51,16 @@ export type ResolveResponse =
       normalized_query: string;
       url: string;
       match: SuggestItem;
-      debug?: unknown;
-    }
-  | {
-      action: "disambiguate";
-      query: string;
-      normalized_query: string;
-      candidates: SuggestItem[];
-      debug?: unknown;
+      debug?: any;
     }
   | {
       action: "serp";
       query: string;
       normalized_query: string;
       reason: string;
-      debug?: unknown;
     };
 
-export type SearchResponse = {
-  q: string;
-  normalized_q: string;
-  did_you_mean: string | null;
-  groups: {
-    locations: SuggestItem[];
-    projects: SuggestItem[];
-    builders: SuggestItem[];
-    rate_pages: SuggestItem[];
-    property_pdps: SuggestItem[];
-  };
-  fallbacks: {
-    relaxed_used: boolean;
-    reason: string | null;
-    trending: Array<{
-      id: string;
-      entity_type: SearchEntityType;
-      name: string;
-      city?: string;
-      city_id?: string;
-      parent_name?: string;
-      canonical_url: string;
-      popularity_score?: number;
-    }>;
-  };
+export type TrendingResponse = {
+  city_id: string | null;
+  items: SuggestItem[];
 };
