@@ -1,134 +1,139 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React from "react";
 import { useRouter } from "next/navigation";
-import { apiGet } from "@/lib/api";
-import type {ResolveResponse, SuggestResponse } from "@/lib/types";
+import { apiGet } from "../lib/api";
 
-type RecentSearch = {
+type EntityOut = {
+  id: string;
+  entity_type: string;
+  name: string;
+  city?: string;
+  city_id?: string;
+  parent_name?: string;
+  canonical_url: string;
+  score?: number | null;
+  popularity_score?: number | null;
+};
+
+type SuggestResponse = {
   q: string;
-  cityId?: string | null;
+  normalized_q: string;
+  did_you_mean?: string | null;
+  groups: Record<string, EntityOut[]>;
+  fallbacks?: {
+    relaxed_used?: boolean;
+    trending?: EntityOut[];
+    reason?: string | null;
+  };
+};
+
+type ResolveResponse = {
+  action: "redirect" | "serp";
+  query: string;
+  normalized_query: string;
+  url?: string | null;
+  match?: EntityOut | null;
+  reason?: string | null;
+  debug?: Record<string, any> | null;
+};
+
+type RecentQuery = {
+  q: string;
+  cityId?: string;
   ts: number;
 };
 
-const RECENTS_KEY = "re_recent_searches_v1";
-const MAX_RECENTS = 8;
-
 function normalizeSpace(s: string) {
-  return s.replace(/\s+/g, " ").trim();
+  return (s || "").replace(/\s+/g, " ").trim();
 }
 
 function badgeForEntityType(t: string) {
-  const x = (t || "").toLowerCase();
-  if (x === "builder" || x === "developer") return "BLD";
-  if (x === "project") return "PRJ";
-  if (x === "rate_page") return "RATE";
-  if (x === "property_pdp") return "PROP";
-  if (x === "city") return "CITY";
-  if (x === "micromarket") return "MM";
-  if (x === "locality") return "LOC";
-  return "ENT";
+  const m: Record<string, string> = {
+    city: "CITY",
+    micromarket: "MM",
+    locality: "LOC",
+    project: "PRJ",
+    builder: "BLD",
+    developer: "BLD",
+    rate_page: "RATE",
+    property_pdp: "PROP",
+    listing_page: "LIST",
+    locality_overview: "LOC",
+  };
+  return m[t] || t.toUpperCase().slice(0, 4);
 }
 
-function safeParseRecents(raw: string | null): RecentSearch[] {
-  if (!raw) return [];
+const RECENTS_KEY = "re_search_recents_v1";
+
+function loadRecents(): RecentQuery[] {
+  if (typeof window === "undefined") return [];
   try {
-    const parsed = JSON.parse(raw);
-
-    // v0 migration: array of strings
-    if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
-      const now = Date.now();
-      return parsed
-        .map((q: string, i: number) => ({ q: normalizeSpace(q), cityId: null, ts: now - i }))
-        .filter((x) => x.q);
-    }
-
-    // v1: array of objects
-    if (Array.isArray(parsed)) {
-      const out: RecentSearch[] = [];
-      for (const item of parsed) {
-        if (item && typeof item === "object") {
-          const q = typeof (item as any).q === "string" ? normalizeSpace((item as any).q) : "";
-          const cityId =
-            typeof (item as any).cityId === "string"
-              ? (item as any).cityId
-              : (item as any).cityId === null
-                ? null
-                : undefined;
-          const ts = typeof (item as any).ts === "number" ? (item as any).ts : Date.now();
-          if (q) out.push({ q, cityId: cityId ?? null, ts });
-        }
-      }
-      return out;
-    }
-
-    return [];
+    const raw = window.localStorage.getItem(RECENTS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as RecentQuery[];
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((x) => x && typeof x.q === "string" && typeof x.ts === "number")
+      .slice(0, 8);
   } catch {
     return [];
   }
 }
 
-function writeRecents(recents: RecentSearch[]) {
+function saveRecents(items: RecentQuery[]) {
+  if (typeof window === "undefined") return;
   try {
-    localStorage.setItem(RECENTS_KEY, JSON.stringify(recents.slice(0, MAX_RECENTS)));
+    window.localStorage.setItem(RECENTS_KEY, JSON.stringify(items.slice(0, 8)));
   } catch {
     // ignore
   }
 }
 
-export default function SearchBar(props?: { initialQ?: string; initialCityId?: string }) {
+export default function SearchBar({ initialQuery = "", initialCityId = "" }: { initialQuery?: string; initialCityId?: string }) {
   const router = useRouter();
 
-  const [q, setQ] = useState<string>(props?.initialQ ?? "");
-  const [cityId, setCityId] = useState<string>(props?.initialCityId ?? "");
-  const [open, setOpen] = useState(false);
+  const [q, setQ] = React.useState<string>(initialQuery);
+  const [cityId, setCityId] = React.useState<string>(initialCityId);
 
-  const [loading, setLoading] = useState(false);
-  const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
+  const [open, setOpen] = React.useState<boolean>(false);
+  const [loading, setLoading] = React.useState<boolean>(false);
 
-  const [trending, setTrending] = useState<EntityOut[]>([]);
-  const [trendingLoading, setTrendingLoading] = useState(false);
+  const [suggest, setSuggest] = React.useState<SuggestResponse | null>(null);
 
-  const [recents, setRecents] = useState<RecentSearch[]>([]);
+  const [trendingLoading, setTrendingLoading] = React.useState<boolean>(false);
+  const [trending, setTrending] = React.useState<EntityOut[]>([]);
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [recents, setRecents] = React.useState<RecentQuery[]>([]);
 
-  const qTrim = useMemo(() => normalizeSpace(q), [q]);
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
 
-  // Lock page scroll when dropdown is open
-  useEffect(() => {
-    if (!open) return;
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, [open]);
+  const qTrim = normalizeSpace(q);
 
-  // Load recents on mount
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const loaded = safeParseRecents(localStorage.getItem(RECENTS_KEY));
-    setRecents(loaded);
+  // Load recents once on mount
+  React.useEffect(() => {
+    setRecents(loadRecents());
   }, []);
 
   // Close dropdown on outside click
-  useEffect(() => {
-    function onDown(e: MouseEvent) {
-      if (!containerRef.current) return;
-      if (containerRef.current.contains(e.target as Node)) return;
-      setOpen(false);
+  React.useEffect(() => {
+    function onDocDown(e: MouseEvent) {
+      const el = containerRef.current;
+      if (!el) return;
+      if (!el.contains(e.target as Node)) {
+        setOpen(false);
+      }
     }
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
   }, []);
 
-  async function fetchTrending() {
+  async function fetchTrending(city_id: string) {
+    setTrendingLoading(true);
     try {
-      setTrendingLoading(true);
-      const res = await apiGet<{ city_id?: string | null; items: EntityOut[] }>("/api/v1/search/trending", {
-        city_id: cityId || undefined,
+      const res = await apiGet<{ city_id?: string; items: EntityOut[] }>("/api/v1/search/trending", {
+        city_id: city_id || undefined,
         limit: 8,
       });
       setTrending(res.items || []);
@@ -139,82 +144,69 @@ export default function SearchBar(props?: { initialQ?: string; initialCityId?: s
     }
   }
 
-  async function fetchSuggest(query: string) {
-    setLoading(true);
-    try {
-      const res = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
-        q: query,
-        city_id: cityId || undefined,
-        limit: 10,
-      });
-      setSuggest(res);
-    } catch {
-      setSuggest(null);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Whenever dropdown opens, load trending if q is empty
-  useEffect(() => {
+  // When dropdown opens and query empty -> load trending
+  React.useEffect(() => {
     if (!open) return;
-    if (!qTrim) {
-      fetchTrending();
-      setSuggest(null);
-    }
+    if (qTrim) return;
+    fetchTrending(cityId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, cityId]);
+  }, [open, qTrim, cityId]);
 
-  // Debounce suggest fetch
-  useEffect(() => {
+  // Debounced suggest fetch when query exists
+  React.useEffect(() => {
     if (!open) return;
-
     if (!qTrim) {
       setSuggest(null);
+      setLoading(false);
       return;
     }
 
-    const t = setTimeout(() => {
-      fetchSuggest(qTrim);
+    let cancelled = false;
+    setLoading(true);
+
+    const t = window.setTimeout(async () => {
+      try {
+        const res = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
+          q: qTrim,
+          city_id: cityId || undefined,
+          limit: 10,
+        });
+        if (!cancelled) setSuggest(res);
+      } catch {
+        if (!cancelled) setSuggest(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     }, 180);
 
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
   }, [qTrim, cityId, open]);
 
   function pushRecent(query: string) {
-    const cleaned = normalizeSpace(query);
-    if (!cleaned) return;
+    const item: RecentQuery = { q: query, cityId: cityId || undefined, ts: Date.now() };
 
-    const now = Date.now();
-    const next: RecentSearch[] = [
-      { q: cleaned, cityId: cityId || null, ts: now },
-      ...recents.filter((r) => !(normalizeSpace(r.q).toLowerCase() === cleaned.toLowerCase() && (r.cityId || "") === (cityId || ""))),
-    ].slice(0, MAX_RECENTS);
+    const current = loadRecents();
+    // de-dupe by (q + cityId)
+    const key = `${item.q}::${item.cityId || ""}`;
+    const next = [item, ...current.filter((r) => `${r.q}::${r.cityId || ""}` !== key)].slice(0, 8);
 
+    saveRecents(next);
     setRecents(next);
-    writeRecents(next);
   }
 
   function goToSerp(query: string) {
-    const cleaned = normalizeSpace(query);
-    if (!cleaned) return;
-
-    pushRecent(cleaned);
-
-    const params = new URLSearchParams();
-    params.set("q", cleaned);
-    if (cityId) params.set("city_id", cityId);
-
-    router.push(`/search?${params.toString()}`);
+    const url = `/search?q=${encodeURIComponent(query)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`;
+    router.push(url);
     setOpen(false);
   }
 
-  function goToGo(url: string, query?: string) {
-    const params = new URLSearchParams();
-    params.set("url", url);
-    if (query && normalizeSpace(query)) params.set("q", normalizeSpace(query));
-    router.push(`/go?${params.toString()}`);
+  function goToGo(targetUrl: string, query?: string) {
+    // In your demo app, we route through /go to show the final destination; keep it consistent
+    const u = `/go?url=${encodeURIComponent(targetUrl)}${query ? `&q=${encodeURIComponent(query)}` : ""}`;
+    router.push(u);
     setOpen(false);
   }
 
@@ -253,12 +245,7 @@ export default function SearchBar(props?: { initialQ?: string; initialCityId?: s
     const metaParts = [e.entity_type, e.city, e.parent_name].filter(Boolean);
 
     return (
-      <button
-        key={e.id}
-        type="button"
-        className="item"
-        onClick={() => goToGo(e.canonical_url, qTrim)}
-      >
+      <button key={e.id} type="button" className="item" onClick={() => goToGo(e.canonical_url, qTrim)}>
         <div className="itemLeft">
           <span className="badge">{badge}</span>
         </div>
@@ -401,9 +388,11 @@ export default function SearchBar(props?: { initialQ?: string; initialCityId?: s
               )}
 
               {/* IMPORTANT: do NOT show this when q is empty */}
-              <button type="button" className="seeAll" onClick={() => goToSerp(qTrim)}>
-                See all results for "{qTrim}"
-              </button>
+              {qTrim ? (
+                <button type="button" className="seeAll" onClick={() => goToSerp(qTrim)}>
+                  See all results for "{qTrim}"
+                </button>
+              ) : null}
             </>
           )}
         </div>
