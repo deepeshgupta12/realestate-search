@@ -103,8 +103,10 @@ export default function SearchBar({
   }
 
   function goToSerp(query: string, nextCityId: string) {
+    const trimmed = query.trim();
+    if (!trimmed) return; // IMPORTANT: do nothing for empty query
     const qp = new URLSearchParams();
-    qp.set("q", query);
+    qp.set("q", trimmed);
     if (nextCityId) qp.set("city_id", nextCityId);
     router.push(`/search?${qp.toString()}`);
     setOpen(false);
@@ -152,7 +154,6 @@ export default function SearchBar({
       const empty = isEmptyGroups(r);
       if (empty) {
         setNoResults(true);
-        // Prefer backend-provided trending fallback; else fetch trending
         if (r.fallbacks?.trending?.length) {
           setTrending(r.fallbacks.trending);
         } else {
@@ -182,14 +183,14 @@ export default function SearchBar({
   function onSubmit() {
     const trimmed = q.trim();
     if (!trimmed) {
-      setOpen(true);
+      // Keep dropdown open (trending) but DO NOT navigate
+      refreshDropdown("", cityId).catch(() => setOpen(true));
       return;
     }
     goToSerp(trimmed, cityId);
   }
 
   React.useEffect(() => {
-    // close on outside click
     function onDocClick(e: MouseEvent) {
       const el = boxRef.current;
       if (!el) return;
@@ -200,12 +201,11 @@ export default function SearchBar({
   }, []);
 
   React.useEffect(() => {
-    // ensure trending loaded for empty query on first focus
-    if (!q.trim()) {
-      loadTrending(cityId).catch(() => {});
-    }
+    if (!q.trim()) loadTrending(cityId).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const trimmedQ = q.trim();
 
   return (
     <div className="searchWrap" ref={boxRef}>
@@ -216,7 +216,6 @@ export default function SearchBar({
           onChange={(e) => {
             const nextCityId = e.target.value;
             setCityId(nextCityId);
-            // refresh dropdown based on current query
             refreshDropdown(q, nextCityId).catch(() => {});
           }}
         >
@@ -252,36 +251,39 @@ export default function SearchBar({
         <div
           className="dropdown"
           onWheel={(e) => {
-            // Critical: stop wheel events from scrolling the whole page behind the dropdown.
             e.stopPropagation();
           }}
         >
           {loading && <div className="sectionTitle">Loading…</div>}
 
-          {!loading && didYouMean && q.trim() && didYouMean.toLowerCase() !== q.trim().toLowerCase() && (
-            <div className="didYouMean">
-              Did you mean <strong>{didYouMean}</strong>?
-            </div>
-          )}
+          {!loading &&
+            didYouMean &&
+            trimmedQ &&
+            didYouMean.toLowerCase() !== trimmedQ.toLowerCase() && (
+              <div className="didYouMean">
+                Did you mean <strong>{didYouMean}</strong>?
+              </div>
+            )}
 
-          {!loading && sections.map((sec) => (
-            <div key={sec.title}>
-              <div className="sectionTitle">{sec.title}</div>
-              {sec.items.map((it) => (
-                <div
-                  key={it.id}
-                  className="item"
-                  onClick={() => goToUrl(it.canonical_url, q.trim())}
-                >
-                  <div className="badge">{badgeFor(it.entity_type)}</div>
-                  <div className="itemMain">
-                    <div className="itemName">{highlight(it.name, q)}</div>
-                    <div className="itemMeta">{formatMeta(it)}</div>
+          {!loading &&
+            sections.map((sec) => (
+              <div key={sec.title}>
+                <div className="sectionTitle">{sec.title}</div>
+                {sec.items.map((it) => (
+                  <div
+                    key={it.id}
+                    className="item"
+                    onClick={() => goToUrl(it.canonical_url, trimmedQ)}
+                  >
+                    <div className="badge">{badgeFor(it.entity_type)}</div>
+                    <div className="itemMain">
+                      <div className="itemName">{highlight(it.name, q)}</div>
+                      <div className="itemMeta">{formatMeta(it)}</div>
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
-          ))}
+                ))}
+              </div>
+            ))}
 
           {!loading && noResults && (
             <div>
@@ -292,7 +294,7 @@ export default function SearchBar({
                 <div
                   key={it.id}
                   className="item"
-                  onClick={() => goToUrl(it.canonical_url, q.trim() || it.name)}
+                  onClick={() => goToUrl(it.canonical_url, trimmedQ || it.name)}
                 >
                   <div className="badge">{badgeFor(it.entity_type)}</div>
                   <div className="itemMain">
@@ -304,7 +306,7 @@ export default function SearchBar({
             </div>
           )}
 
-          {!loading && !q.trim() && trending.length > 0 && (
+          {!loading && !trimmedQ && trending.length > 0 && (
             <div>
               <div className="sectionTitle">Trending</div>
               {trending.map((it) => (
@@ -323,12 +325,12 @@ export default function SearchBar({
             </div>
           )}
 
-          <div
-            className="footerAction"
-            onClick={() => goToSerp(q.trim() || "", cityId)}
-          >
-            See all results for "{(q.trim() || "").slice(0, 80)}"
-          </div>
+          {/* IMPORTANT: show this only when there is a non-empty query */}
+          {!loading && trimmedQ && (
+            <div className="footerAction" onClick={() => goToSerp(trimmedQ, cityId)}>
+              See all results for "{trimmedQ.slice(0, 80)}"
+            </div>
+          )}
         </div>
       )}
     </div>
