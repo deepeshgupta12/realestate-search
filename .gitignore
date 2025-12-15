@@ -16,3 +16,13 @@ frontend/.env.local
 # Data/artifacts
 data/
 artifacts/
+# ---- Python runtime ----
+__pycache__/
+*.py[cod]
+
+# ---- Local event logs (runtime) ----
+backend/.events/
+
+# ---- Backup files created during edits ----
+*.bak
+*.bak_*

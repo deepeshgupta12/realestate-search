@@ -1,244 +1,132 @@
 import Link from "next/link";
-import SearchBar from "@/components/SearchBar";
-import { apiGet } from "@/lib/api";
-import type { SuggestItem, SuggestResponse } from "@/lib/types";
+import type { SuggestResponse } from "@/lib/types";
 
-type ParseResponse = {
-  q: string;
-  intent: string | null;
-  bhk: number | null;
-  locality_hint: string | null;
-  max_price: number | null;
-  max_rent: number | null;
-  currency: string;
-  ok: boolean;
-};
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
-type SearchParams = { q?: string; city_id?: string };
-type Props = { searchParams: SearchParams | Promise<SearchParams> };
+export default async function SearchPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string; city_id?: string; qid?: string }>;
+}) {
+  const sp = await searchParams;
+  const q = (sp.q || "").trim();
+  const city_id = (sp.city_id || "").trim();
+  const qid = (sp.qid || "").trim();
 
-function labelFor(e: SuggestItem): string {
-  switch (e.entity_type) {
-    case "builder":
-      return "BLD";
-    case "city":
-      return "CITY";
-    case "project":
-      return "PRJ";
-    case "micromarket":
-      return "MM";
-    case "locality":
-      return "LOC";
-    case "rate_page":
-      return "RATE";
-    case "property_pdp":
-      return "PROP";
-    default:
-      return "RES";
-  }
-}
-
-function metaFor(e: SuggestItem): string {
-  const bits: string[] = [];
-  if (e.entity_type) bits.push(e.entity_type);
-  if (e.city) bits.push(e.city);
-  if (e.parent_name) bits.push(e.parent_name);
-  return bits.join(" • ");
-}
-
-function goHref(canonicalUrl: string, q: string) {
-  const sp = new URLSearchParams();
-  sp.set("url", canonicalUrl);
-  if (q) sp.set("q", q);
-  return `/go?${sp.toString()}`;
-}
-
-function ResultCard({ e, q }: { e: SuggestItem; q: string }) {
-  return (
-    <Link className="resultCard" href={goHref(e.canonical_url, q)}>
-      <div className="tag">{labelFor(e)}</div>
-      <div>
-        <div className="resultTitle">{e.name}</div>
-        <div className="resultMeta">{metaFor(e)}</div>
-        <div className="resultMeta">URL: {e.canonical_url}</div>
-      </div>
-    </Link>
-  );
-}
-
-export default async function SearchPage(props: Props) {
-  const sp = await props.searchParams;
-
-  const rawQ = (sp?.q ?? "").toString().trim();
-  const city_id = (sp?.city_id ?? "").toString().trim();
-
-  return (
-    <div className="appShell">
-      <main className="page">
-        <div className="hero">
-          <h1 className="title">Search results</h1>
-          <div className="sub">Type a query to see results.</div>
-        </div>
-
-        <SearchBar initialQ={rawQ} initialCityId={city_id} />
-
-        {!rawQ ? null : (
-          <div className="card" style={{ marginTop: 14 }}>
-            <div className="kv">
-              <div>Query</div>
-              <div style={{ opacity: 0.9 }}>{rawQ}</div>
-            </div>
-
-            {(() => {
-              // 1) Parse query
-              // (server-side so /search can also behave like a SERP for constraint queries)
-              return null;
-            })()}
-          </div>
-        )}
-
-        {rawQ ? (
-          <ResultsBlock q={rawQ} cityId={city_id} />
-        ) : null}
+  if (!q) {
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <h1 className="text-xl font-semibold">Search</h1>
+        <p className="mt-2 text-gray-600">Missing query. Try /search?q=baner</p>
       </main>
-    </div>
-  );
-}
+    );
+  }
 
-async function ResultsBlock({ q, cityId }: { q: string; cityId: string }) {
-  const parse = await apiGet<ParseResponse>("/api/v1/search/parse", { q });
-  const effectiveQ = (parse?.locality_hint || q).trim();
+  const u = new URL(`${API_BASE}/api/v1/search`);
+  u.searchParams.set("q", q);
+  u.searchParams.set("limit", "20");
+  if (city_id) u.searchParams.set("city_id", city_id);
 
-  const data = await apiGet<SuggestResponse>("/api/v1/search", {
-    q: effectiveQ,
-    city_id: cityId || undefined,
-    limit: 10,
-  });
+  const res = await fetch(u.toString(), { cache: "no-store" });
+  const data = (await res.json()) as SuggestResponse;
 
-  const groups = data?.groups || {
-    locations: [],
-    projects: [],
-    builders: [],
-    rate_pages: [],
-    property_pdps: [],
-  };
+  const sections = [
+    { key: "locations", title: "Locations", items: data.groups.locations },
+    { key: "projects", title: "Projects", items: data.groups.projects },
+    { key: "builders", title: "Builders", items: data.groups.builders },
+    { key: "rate_pages", title: "Property Rates", items: data.groups.rate_pages },
+    { key: "property_pdps", title: "Properties", items: data.groups.property_pdps },
+  ].filter((s) => s.items.length > 0);
 
-  const total =
-    (groups.locations?.length || 0) +
-    (groups.projects?.length || 0) +
-    (groups.builders?.length || 0) +
-    (groups.rate_pages?.length || 0) +
-    (groups.property_pdps?.length || 0);
-
-  const trending = data?.fallbacks?.trending || [];
-  const showTrending = total === 0 && trending.length > 0;
+  function goHref(args: {
+    url: string;
+    entity_id?: string;
+    entity_type?: string;
+    rank: number;
+  }) {
+    const go = new URL("http://example.com/go");
+    go.searchParams.set("url", args.url);
+    if (qid) go.searchParams.set("qid", qid);
+    go.searchParams.set("rank", String(args.rank));
+    if (args.entity_id) go.searchParams.set("entity_id", args.entity_id);
+    if (args.entity_type) go.searchParams.set("entity_type", args.entity_type);
+    if (city_id) go.searchParams.set("city_id", city_id);
+    go.searchParams.set("context_url", `/search?q=${encodeURIComponent(q)}`);
+    return go.pathname + "?" + go.searchParams.toString();
+  }
 
   return (
-    <>
-      <div className="card" style={{ marginTop: 14 }}>
-        <div className="kv">
-          <div>Effective query</div>
-          <div style={{ opacity: 0.9 }}>{effectiveQ}</div>
-        </div>
-        <div className="kv">
-          <div>Results</div>
-          <div style={{ opacity: 0.9 }}>{total}</div>
-        </div>
-        {data?.did_you_mean ? (
-          <div className="hint" style={{ marginTop: 10 }}>
-            Did you mean{" "}
-            <Link className="link" href={`/search?q=${encodeURIComponent(data.did_you_mean)}`}>
-              {data.did_you_mean}
-            </Link>
-            ?
-          </div>
-        ) : null}
-      </div>
+    <main className="mx-auto max-w-3xl p-6">
+      <h1 className="text-xl font-semibold">Results for “{q}”</h1>
 
-      {total === 0 ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">No results found</div>
-          <div className="sub" style={{ marginTop: 6 }}>
-            Try a different spelling or choose from trending.
-          </div>
+      {data.did_you_mean ? (
+        <p className="mt-2 text-sm text-gray-600">
+          Did you mean: <span className="font-medium">{data.did_you_mean}</span>
+        </p>
+      ) : null}
 
-          {showTrending ? (
-            <div style={{ marginTop: 12 }}>
-              <div className="sectionTitle" style={{ fontSize: 13, opacity: 0.75 }}>
-                Trending
-              </div>
+      {sections.length === 0 ? (
+        <div className="mt-6 rounded border border-gray-200 p-4">
+          <p className="text-gray-700">No results found.</p>
 
-              <div className="pillRow" style={{ marginTop: 10 }}>
-                {trending.map((e) => (
-                  <Link
-                    key={e.id}
-                    className="pill"
-                    href={goHref(e.canonical_url, "")}
-                    title={metaFor(e)}
-                  >
-                    {e.name}
-                  </Link>
+          {data.fallbacks?.trending?.length ? (
+            <>
+              <p className="mt-3 text-sm font-semibold text-gray-600">Trending</p>
+              <ul className="mt-2 space-y-2">
+                {data.fallbacks.trending.map((t, i) => (
+                  <li key={t.id} className="rounded border border-gray-100 p-3">
+                    <Link
+                      href={goHref({
+                        url: t.canonical_url,
+                        entity_id: t.id,
+                        entity_type: t.entity_type,
+                        rank: i + 1,
+                      })}
+                      className="text-sm font-medium hover:underline"
+                    >
+                      {t.name}
+                    </Link>
+                    <div className="mt-1 text-xs text-gray-500">
+                      {t.entity_type}
+                      {t.city ? ` · ${t.city}` : ""}
+                    </div>
+                  </li>
                 ))}
-              </div>
-            </div>
+              </ul>
+            </>
           ) : null}
         </div>
-      ) : null}
-
-      {groups.locations?.length ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">Locations</div>
-          <div style={{ marginTop: 10 }}>
-            {groups.locations.map((e) => (
-              <ResultCard key={e.id} e={e} q={q} />
-            ))}
-          </div>
+      ) : (
+        <div className="mt-6 space-y-6">
+          {sections.map((sec) => (
+            <section key={sec.key}>
+              <h2 className="text-sm font-semibold text-gray-600">{sec.title}</h2>
+              <ul className="mt-2 space-y-2">
+                {sec.items.map((it, idx) => (
+                  <li key={it.id} className="rounded border border-gray-100 p-3">
+                    <Link
+                      href={goHref({
+                        url: it.canonical_url,
+                        entity_id: it.id,
+                        entity_type: it.entity_type,
+                        rank: idx + 1,
+                      })}
+                      className="text-sm font-medium hover:underline"
+                    >
+                      {it.name}
+                    </Link>
+                    <div className="mt-1 text-xs text-gray-500">
+                      {it.entity_type}
+                      {it.parent_name ? ` · ${it.parent_name}` : ""}
+                      {it.city ? ` · ${it.city}` : ""}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
         </div>
-      ) : null}
-
-      {groups.projects?.length ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">Projects</div>
-          <div style={{ marginTop: 10 }}>
-            {groups.projects.map((e) => (
-              <ResultCard key={e.id} e={e} q={q} />
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {groups.builders?.length ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">Builders</div>
-          <div style={{ marginTop: 10 }}>
-            {groups.builders.map((e) => (
-              <ResultCard key={e.id} e={e} q={q} />
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {groups.rate_pages?.length ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">Property Rates</div>
-          <div style={{ marginTop: 10 }}>
-            {groups.rate_pages.map((e) => (
-              <ResultCard key={e.id} e={e} q={q} />
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {groups.property_pdps?.length ? (
-        <div className="card" style={{ marginTop: 14 }}>
-          <div className="sectionTitle">Properties</div>
-          <div style={{ marginTop: 10 }}>
-            {groups.property_pdps.map((e) => (
-              <ResultCard key={e.id} e={e} q={q} />
-            ))}
-          </div>
-        </div>
-      ) : null}
-    </>
+      )}
+    </main>
   );
 }

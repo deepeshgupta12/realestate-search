@@ -3,420 +3,525 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiGet } from "@/lib/api";
-import type { EntityOut, ResolveResponse, SuggestResponse, ZeroStateResponse } from "@/lib/types";
+import type { EntityOut, SuggestResponse, ZeroStateResponse } from "@/lib/types";
 
-type RecentSearch = {
-  q: string;
-  cityId?: string | null;
-  ts: number;
+type Props = { className?: string };
+
+type RecentItem = { q: string; cityId?: string; ts: number };
+
+type ResolveResponse = {
+  action: "redirect" | "serp" | "disambiguate";
+  query: string;
+  normalized_query: string;
+  url?: string | null;
+  match?: EntityOut | null;
+  reason?: string | null;
+  debug?: Record<string, any> | null;
 };
 
-const RECENTS_KEY = "re_recent_searches_v1";
-const MAX_RECENTS = 8;
+const LS_KEY = "re_recent_searches_v1";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api/v1";
 
-function normalizeSpace(s: string) {
-  return s.replace(/\s+/g, " ").trim();
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function badgeForEntityType(t: string) {
-  const x = (t || "").toLowerCase();
-  if (x === "builder" || x === "developer") return "BLD";
-  if (x === "project") return "PRJ";
-  if (x === "rate_page") return "RATE";
-  if (x === "property_pdp") return "PROP";
-  if (x === "city") return "CITY";
-  if (x === "micromarket") return "MM";
-  if (x === "locality") return "LOC";
-  return "ENT";
+function mkQueryId() {
+  // stable, no extra deps
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return `qid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function safeJson<T>(v: string | null): T | null {
-  if (!v) return null;
+function buildUrl(path: string, query?: Record<string, any>) {
+  const u = new URL(`${API_BASE}${path}`);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null || v === "") continue;
+      u.searchParams.set(k, String(v));
+    }
+  }
+  return u.toString();
+}
+
+async function apiPost<T>(path: string, body: any): Promise<T> {
+  const res = await fetch(buildUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`POST ${path} failed: ${res.status} ${txt}`);
+  }
+  return (await res.json()) as T;
+}
+
+function loadRecents(): RecentItem[] {
   try {
-    return JSON.parse(v) as T;
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as RecentItem[];
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((x) => x && typeof x.q === "string" && typeof x.ts === "number")
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, 8);
   } catch {
-    return null;
+    return [];
   }
 }
 
-function readRecents(): RecentSearch[] {
-  if (typeof window === "undefined") return [];
-  const raw = window.localStorage.getItem(RECENTS_KEY);
-  const parsed = safeJson<RecentSearch[]>(raw);
-  if (!Array.isArray(parsed)) return [];
-  return parsed
-    .filter((x) => x && typeof x.q === "string" && typeof x.ts === "number")
-    .sort((a, b) => b.ts - a.ts)
-    .slice(0, MAX_RECENTS);
+function saveRecent(item: RecentItem) {
+  const curr = loadRecents();
+  const next = [
+    item,
+    ...curr.filter(
+      (x) => !(x.q.toLowerCase() === item.q.toLowerCase() && (x.cityId || "") === (item.cityId || ""))
+    ),
+  ].slice(0, 8);
+  localStorage.setItem(LS_KEY, JSON.stringify(next));
 }
 
-function writeRecents(items: RecentSearch[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(RECENTS_KEY, JSON.stringify(items.slice(0, MAX_RECENTS)));
+function groupLabel(k: keyof SuggestResponse["groups"]) {
+  switch (k) {
+    case "locations":
+      return "Locations";
+    case "projects":
+      return "Projects";
+    case "builders":
+      return "Builders";
+    case "rate_pages":
+      return "Property Rates";
+    case "property_pdps":
+      return "Properties";
+    default:
+      return String(k);
+  }
 }
 
-function upsertRecent(q: string, cityId: string | null | undefined) {
-  const qq = normalizeSpace(q);
-  if (!qq) return;
-
-  const now = Date.now();
-  const items = readRecents();
-  const filtered = items.filter(
-    (x) => normalizeSpace(x.q).toLowerCase() !== qq.toLowerCase() || (x.cityId || null) !== (cityId || null)
-  );
-  filtered.unshift({ q: qq, cityId: cityId || null, ts: now });
-  writeRecents(filtered);
+function badgeForEntity(e: EntityOut) {
+  // small compact badges (kept minimal to avoid UI regressions)
+  const t = e.entity_type;
+  if (t === "builder" || t === "developer") return "BLD";
+  if (t === "project") return "PRJ";
+  if (t === "rate_page") return "RATE";
+  if (t === "property_pdp") return "PROP";
+  if (t === "locality") return "LOC";
+  if (t === "micromarket") return "MM";
+  if (t === "city") return "CITY";
+  return t.slice(0, 3).toUpperCase();
 }
 
-export default function SearchBar() {
+export default function SearchBar({ className }: Props) {
   const router = useRouter();
 
+  const [q, setQ] = useState("");
   const [cityId, setCityId] = useState<string>("");
-  const [q, setQ] = useState<string>("");
+  const [open, setOpen] = useState(false);
 
-  const [open, setOpen] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [errMsg, setErrMsg] = useState<string | null>(null);
-
+  const [loadingSuggest, setLoadingSuggest] = useState(false);
+  const [suggestErr, setSuggestErr] = useState<string | null>(null);
   const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
+
   const [zero, setZero] = useState<ZeroStateResponse | null>(null);
-  const [recents, setRecents] = useState<RecentSearch[]>([]);
+  const [loadingZero, setLoadingZero] = useState(false);
+  const [zeroErr, setZeroErr] = useState<string | null>(null);
 
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  const debounceRef = useRef<number | null>(null);
-  const reqSeqRef = useRef<number>(0);
+  const [recents, setRecents] = useState<RecentItem[]>([]);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const qTrim = useMemo(() => normalizeSpace(q), [q]);
+  // active query_id for logging click events after a search event is fired
+  const activeQidRef = useRef<string | null>(null);
 
-  // Load local recents once (client-side)
   useEffect(() => {
-    setRecents(readRecents());
+    setRecents(loadRecents());
   }, []);
 
-  // Close on outside click
-  useEffect(() => {
-    function onDoc(e: MouseEvent) {
-      if (!boxRef.current) return;
-      if (!boxRef.current.contains(e.target as any)) setOpen(false);
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, []);
+  const hasText = q.trim().length > 0;
 
-  async function fetchZeroState() {
-    const seq = ++reqSeqRef.current;
-    setLoading(true);
-    setErrMsg(null);
+  const grouped = useMemo(() => {
+    const g = suggest?.groups;
+    if (!g) return [];
+    const keys = Object.keys(g) as (keyof SuggestResponse["groups"])[];
+    return keys
+      .map((k) => ({ k, items: g[k] || [] }))
+      .filter((x) => x.items.length > 0);
+  }, [suggest]);
 
+  async function loadZeroState() {
+    setLoadingZero(true);
+    setZeroErr(null);
     try {
-      const data = await apiGet<ZeroStateResponse>("/search/zero-state", {
+      const z = await apiGet<ZeroStateResponse>("/search/zero-state", {
         city_id: cityId || undefined,
         limit: 8,
       });
-      if (seq !== reqSeqRef.current) return; // stale
-      setZero(data);
+      setZero(z);
     } catch (e: any) {
-      if (seq !== reqSeqRef.current) return;
       setZero(null);
-      setErrMsg(e?.message || "Failed to load zero-state");
+      setZeroErr(e?.message || "Failed to load zero-state");
     } finally {
-      if (seq === reqSeqRef.current) setLoading(false);
+      setLoadingZero(false);
     }
   }
 
-  async function fetchSuggest(query: string) {
-    const seq = ++reqSeqRef.current;
-    setLoading(true);
-    setErrMsg(null);
-
+  async function loadSuggest(nextQ: string) {
+    setLoadingSuggest(true);
+    setSuggestErr(null);
     try {
-      const data = await apiGet<SuggestResponse>("/search/suggest", {
-        q: query,
+      const s = await apiGet<SuggestResponse>("/search/suggest", {
+        q: nextQ,
         city_id: cityId || undefined,
         limit: 10,
       });
-      if (seq !== reqSeqRef.current) return; // stale
-      setSuggest(data);
+      setSuggest(s);
     } catch (e: any) {
-      if (seq !== reqSeqRef.current) return;
       setSuggest(null);
-      setErrMsg(e?.message || "Failed to load suggestions");
+      setSuggestErr(e?.message || "Failed to load suggest");
     } finally {
-      if (seq === reqSeqRef.current) setLoading(false);
+      setLoadingSuggest(false);
     }
   }
 
-  // When dropdown is open:
-  // - if q empty => zero-state
-  // - else => suggest (debounced)
+  // debounce suggest
   useEffect(() => {
     if (!open) return;
 
-    if (!qTrim) {
-      setSuggest(null);
-      fetchZeroState();
-      return;
-    }
-
-    // debounce suggestions
-    if (debounceRef.current) window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(() => {
-      fetchSuggest(qTrim);
+    const t = setTimeout(() => {
+      if (!hasText) {
+        setSuggest(null);
+        setSuggestErr(null);
+        return;
+      }
+      void loadSuggest(q.trim());
     }, 180);
 
-    return () => {
-      if (debounceRef.current) window.clearTimeout(debounceRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, qTrim, cityId]);
+    return () => clearTimeout(t);
+  }, [q, open, cityId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function goResolve(query: string) {
-    const qq = normalizeSpace(query);
-    if (!qq) return;
+  // load zero-state when opening (or city changes while open with empty q)
+  useEffect(() => {
+    if (!open) return;
+    if (hasText) return;
+    void loadZeroState();
+  }, [open, cityId, hasText]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    setLoading(true);
-    setErrMsg(null);
+  function close() {
+    setOpen(false);
+    setSuggestErr(null);
+    setZeroErr(null);
+  }
 
+  function openDropdown() {
+    setOpen(true);
+  }
+
+  function persistRecent(text: string) {
+    const item: RecentItem = { q: text, cityId: cityId || undefined, ts: Date.now() };
+    saveRecent(item);
+    setRecents(loadRecents());
+  }
+
+  function fireSearchEvent(params: {
+    query_id: string;
+    raw_query: string;
+    normalized_query: string;
+    city_id?: string | null;
+    context_url?: string | null;
+  }) {
+    // fire-and-forget (do not block navigation)
+    void apiPost<{ ok: boolean }>("/events/search", {
+      query_id: params.query_id,
+      raw_query: params.raw_query,
+      normalized_query: params.normalized_query,
+      city_id: params.city_id ?? null,
+      context_url: params.context_url ?? null,
+      timestamp: nowIso(),
+    }).catch(() => {});
+  }
+
+  function fireClickEvent(params: {
+    query_id: string;
+    entity_id: string;
+    entity_type: string;
+    rank: number;
+    url: string;
+  }) {
+    void apiPost<{ ok: boolean }>("/events/click", {
+      query_id: params.query_id,
+      entity_id: params.entity_id,
+      entity_type: params.entity_type,
+      rank: params.rank,
+      url: params.url,
+      timestamp: nowIso(),
+    }).catch(() => {});
+  }
+
+  function newQid(raw: string) {
+    const qid = mkQueryId();
+    activeQidRef.current = qid;
+    fireSearchEvent({
+      query_id: qid,
+      raw_query: raw,
+      normalized_query: raw.trim().toLowerCase(),
+      city_id: cityId || null,
+      context_url: "/",
+    });
+    return qid;
+  }
+
+  async function onSubmit() {
+    const text = q.trim();
+    if (!text) return;
+
+    persistRecent(text);
+    close();
+
+    const qid = newQid(text);
+
+    // Resolve: redirect vs serp (and serp url returned for constraint-heavy)
     try {
-      const res = await apiGet<ResolveResponse>("/search/resolve", {
-        q: qq,
+      const r = await apiGet<ResolveResponse>("/search/resolve", {
+        q: text,
         city_id: cityId || undefined,
       });
 
-      // Save local recent (V0)
-      upsertRecent(qq, cityId || null);
-      setRecents(readRecents());
-
-      if (res.action === "redirect" && res.url) {
-        router.push(res.url);
-        setOpen(false);
+      if (r.action === "redirect" && r.url) {
+        // log click if resolver returned match
+        if (r.match?.id && r.match?.entity_type) {
+          fireClickEvent({
+            query_id: qid,
+            entity_id: r.match.id,
+            entity_type: r.match.entity_type,
+            rank: 1,
+            url: r.url,
+          });
+        }
+        router.push(`/go?url=${encodeURIComponent(r.url)}&q=${encodeURIComponent(text)}`);
         return;
       }
 
-      // serp action => URL may already be built by backend (your Step 2.1 fix)
-      if (res.action === "serp" && res.url) {
-        router.push(res.url);
-        setOpen(false);
-        return;
-      }
-
-      // fallback
-      router.push(`/search?q=${encodeURIComponent(qq)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`);
-      setOpen(false);
-    } catch (e: any) {
-      setErrMsg(e?.message || "Resolve failed");
-    } finally {
-      setLoading(false);
+      // SERP path (prefer backend-provided url)
+      const serpUrl = r.url || `/search?q=${encodeURIComponent(text)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`;
+      router.push(serpUrl);
+    } catch {
+      // fallback: go to SERP
+      router.push(`/search?q=${encodeURIComponent(text)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`);
     }
   }
 
-  function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    goResolve(qTrim);
+  function onPickEntity(e: EntityOut, rank: number) {
+    const label = e.name || q.trim() || "search";
+    const raw = q.trim() || label;
+
+    persistRecent(raw);
+    close();
+
+    const qid = newQid(raw);
+    fireClickEvent({
+      query_id: qid,
+      entity_id: e.id,
+      entity_type: e.entity_type,
+      rank,
+      url: e.canonical_url,
+    });
+
+    router.push(`/go?url=${encodeURIComponent(e.canonical_url)}&q=${encodeURIComponent(label)}`);
   }
 
-  const showSeeAll = qTrim.length > 0; // prevents: See all results for ""
+  function onPickSerp(text: string) {
+    const raw = text.trim();
+    if (!raw) return;
 
-  const localRecentQueries = recents
-    .filter((x) => (cityId ? (x.cityId || "") === cityId : true))
-    .slice(0, MAX_RECENTS);
+    persistRecent(raw);
+    close();
 
-  const backendRecentQueries = (zero?.recent_searches || []).filter((x) => typeof x === "string" && x.trim());
-
-  // Prefer backend recent_searches if it starts getting populated later; else use localStorage recents
-  const recentForUI =
-    backendRecentQueries.length > 0
-      ? backendRecentQueries.map((s) => ({ q: normalizeSpace(s), cityId: cityId || null, ts: 0 }))
-      : localRecentQueries;
-
-  const zeroTrending = zero?.trending_searches || [];
-  const zeroLocalities = zero?.trending_localities || [];
-
-  const groups = suggest?.groups;
-  const hasSuggestResults =
-    !!groups && (groups.locations.length + groups.projects.length + groups.builders.length + groups.rate_pages.length + groups.property_pdps.length) > 0;
+    newQid(raw);
+    router.push(`/search?q=${encodeURIComponent(raw)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`);
+  }
 
   return (
-    <div ref={boxRef} className="w-full">
-      <form onSubmit={onSubmit} className="flex items-center gap-2">
+    <div className={className}>
+      <div className="searchBar">
         <select
-          className="h-10 rounded-lg border border-white/10 bg-white/5 px-3 text-sm"
+          className="select"
           value={cityId}
           onChange={(e) => setCityId(e.target.value)}
-          onFocus={() => setOpen(true)}
+          aria-label="City filter"
         >
           <option value="">All Cities</option>
           <option value="city_pune">Pune</option>
           <option value="city_noida">Noida</option>
         </select>
 
-        <input
-          className="h-10 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-sm outline-none"
-          placeholder="Search city, locality, project, builder, rates, properties..."
-          value={q}
-          onChange={(e) => {
-            setQ(e.target.value);
-            setOpen(true);
-          }}
-          onFocus={() => setOpen(true)}
-        />
+        <div className="inputWrap">
+          <input
+            ref={inputRef}
+            className="input"
+            placeholder="Search city, locality, project, builder, rates, properties..."
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              if (!open) openDropdown();
+            }}
+            onFocus={() => openDropdown()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void onSubmit();
+              }
+              if (e.key === "Escape") close();
+            }}
+          />
 
-        <button
-          type="submit"
-          className="h-10 rounded-lg border border-white/10 bg-white/10 px-4 text-sm hover:bg-white/15"
-        >
-          Search
-        </button>
-      </form>
+          <button className="btn" type="button" onClick={() => void onSubmit()}>
+            Search
+          </button>
 
-      {open && (
-        <div className="mt-2 rounded-xl border border-white/10 bg-black/60 backdrop-blur p-2">
-          {loading && <div className="px-3 py-2 text-xs opacity-60">Loading…</div>}
-          {errMsg && <div className="px-3 py-2 text-xs text-red-300">{errMsg}</div>}
+          {open && (
+            <div className="dropdown" role="listbox">
+              {/* Suggest path */}
+              {hasText ? (
+                <div className="ddInner">
+                  {loadingSuggest && <div className="ddMuted">Searching…</div>}
+                  {suggestErr && <div className="ddError">{suggestErr}</div>}
 
-          {/* Empty query => Zero state + Recents */}
-          {!qTrim && (
-            <>
-              {recentForUI.length > 0 && (
-                <div className="mb-2">
-                  <div className="px-3 py-1 text-xs font-semibold opacity-60">Recent searches</div>
-                  <div className="flex flex-wrap gap-2 px-3 pb-2">
-                    {recentForUI.map((x, idx) => (
-                      <button
-                        key={`${x.q}-${x.ts}-${idx}`}
-                        type="button"
-                        onClick={() => goResolve(x.q)}
-                        className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs hover:bg-white/10"
-                      >
-                        {x.q}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {zeroTrending.length > 0 && (
-                <div className="mb-2">
-                  <div className="px-3 py-1 text-xs font-semibold opacity-60">Trending</div>
-                  <div className="grid gap-2 px-2 pb-2">
-                    {zeroTrending.map((it) => (
-                      <button
-                        key={`${it.id}-${it.entity_type}`}
-                        type="button"
-                        onClick={() => router.push(it.canonical_url)}
-                        className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left hover:bg-white/10"
-                      >
-                        <span className="w-10 shrink-0 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-semibold opacity-80">
-                          {badgeForEntityType(it.entity_type)}
-                        </span>
-                        <span className="flex flex-col">
-                          <span className="text-sm font-semibold">{it.name}</span>
-                          <span className="text-xs opacity-60">
-                            {(it.entity_type || "").replace(/_/g, " ")}
-                            {it.city ? ` • ${it.city}` : ""}
-                            {it.parent_name ? ` • ${it.parent_name}` : ""}
-                          </span>
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {zeroLocalities.length > 0 && (
-                <div>
-                  <div className="px-3 py-1 text-xs font-semibold opacity-60">Popular localities</div>
-                  <div className="grid gap-2 px-2 pb-2">
-                    {zeroLocalities.map((it) => (
-                      <button
-                        key={`${it.id}-${it.entity_type}`}
-                        type="button"
-                        onClick={() => router.push(it.canonical_url)}
-                        className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left hover:bg-white/10"
-                      >
-                        <span className="w-10 shrink-0 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-semibold opacity-80">
-                          {badgeForEntityType(it.entity_type)}
-                        </span>
-                        <span className="flex flex-col">
-                          <span className="text-sm font-semibold">{it.name}</span>
-                          <span className="text-xs opacity-60">
-                            {(it.entity_type || "").replace(/_/g, " ")}
-                            {it.city ? ` • ${it.city}` : ""}
-                            {it.parent_name ? ` • ${it.parent_name}` : ""}
-                          </span>
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {/* Non-empty query => Suggest */}
-          {!!qTrim && (
-            <>
-              {suggest?.did_you_mean && (
-                <div className="px-3 py-2 text-xs opacity-70">
-                  Did you mean{" "}
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => {
-                      setQ(suggest.did_you_mean || "");
-                      setOpen(true);
-                    }}
-                  >
-                    {suggest.did_you_mean}
-                  </button>
-                  ?
-                </div>
-              )}
-
-              {hasSuggestResults ? (
-                <div className="grid gap-2 px-2 pb-2">
-                  {(["locations", "projects", "builders", "rate_pages", "property_pdps"] as const).map((k) =>
-                    (groups?.[k] || []).map((it: EntityOut) => (
-                      <button
-                        key={`${k}-${it.id}`}
-                        type="button"
-                        onClick={() => router.push(it.canonical_url)}
-                        className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left hover:bg-white/10"
-                      >
-                        <span className="w-10 shrink-0 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-semibold opacity-80">
-                          {badgeForEntityType(it.entity_type)}
-                        </span>
-                        <span className="flex flex-col">
-                          <span className="text-sm font-semibold">{it.name}</span>
-                          <span className="text-xs opacity-60">
-                            {(it.entity_type || "").replace(/_/g, " ")}
-                            {it.city ? ` • ${it.city}` : ""}
-                            {it.parent_name ? ` • ${it.parent_name}` : ""}
-                          </span>
-                        </span>
-                      </button>
-                    ))
+                  {!loadingSuggest && !suggestErr && grouped.length === 0 && (
+                    <div className="ddMuted">No matches. Press Enter to search.</div>
                   )}
+
+                  {!loadingSuggest &&
+                    !suggestErr &&
+                    grouped.map(({ k, items }) => (
+                      <div key={String(k)} className="ddSection">
+                        <div className="ddTitle">{groupLabel(k)}</div>
+                        <div className="ddList">
+                          {items.map((e, idx) => (
+                            <button
+                              key={`${e.id}:${idx}`}
+                              type="button"
+                              className="ddItem"
+                              onClick={() => onPickEntity(e, idx + 1)}
+                            >
+                              <span className="ddBadge">{badgeForEntity(e)}</span>
+                              <span className="ddText">
+                                <span className="ddName">{e.name}</span>
+                                <span className="ddMeta">
+                                  {e.entity_type}
+                                  {e.city ? ` • ${e.city}` : ""}
+                                  {e.parent_name ? ` • ${e.parent_name}` : ""}
+                                </span>
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+
+                  {/* See all results */}
+                  <div className="ddFooter">
+                    <button
+                      type="button"
+                      className="ddSeeAll"
+                      onClick={() => onPickSerp(q)}
+                    >
+                      See all results for “{q.trim()}”
+                    </button>
+                  </div>
                 </div>
               ) : (
-                <div className="px-3 py-2 text-xs opacity-60">No matches. Press Enter to search.</div>
-              )}
+                // Zero-state path
+                <div className="ddInner">
+                  {loadingZero && <div className="ddMuted">Loading…</div>}
+                  {zeroErr && <div className="ddError">{zeroErr}</div>}
 
-              {showSeeAll && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    router.push(`/search?q=${encodeURIComponent(qTrim)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`)
-                  }
-                  className="mt-1 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-left text-xs hover:bg-white/10"
-                >
-                  See all results for “{qTrim}”
-                </button>
+                  {!loadingZero && !zeroErr && (
+                    <>
+                      {recents.length > 0 && (
+                        <div className="ddSection">
+                          <div className="ddTitle">Recent searches</div>
+                          <div className="ddList">
+                            {recents.map((it, idx) => (
+                              <button
+                                key={`${it.cityId || ""}:${it.q}:${it.ts}:${idx}`}
+                                type="button"
+                                className="ddItem"
+                                onClick={() => {
+                                  setQ(it.q);
+                                  void onPickSerp(it.q);
+                                }}
+                              >
+                                <span className="ddBadge">⟳</span>
+                                <span className="ddText">
+                                  <span className="ddName">{it.q}</span>
+                                  <span className="ddMeta">{it.cityId ? it.cityId : "All cities"}</span>
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {zero?.trending_searches?.length ? (
+                        <div className="ddSection">
+                          <div className="ddTitle">Trending</div>
+                          <div className="ddList">
+                            {zero.trending_searches.map((e, idx) => (
+                              <button
+                                key={`${e.id}:${idx}`}
+                                type="button"
+                                className="ddItem"
+                                onClick={() => onPickEntity(e, idx + 1)}
+                              >
+                                <span className="ddBadge">{badgeForEntity(e)}</span>
+                                <span className="ddText">
+                                  <span className="ddName">{e.name}</span>
+                                  <span className="ddMeta">
+                                    {e.entity_type}
+                                    {e.city ? ` • ${e.city}` : ""}
+                                    {e.parent_name ? ` • ${e.parent_name}` : ""}
+                                  </span>
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {zero?.trending_localities?.length ? (
+                        <div className="ddSection">
+                          <div className="ddTitle">Popular localities</div>
+                          <div className="ddList">
+                            {zero.trending_localities.map((e, idx) => (
+                              <button
+                                key={`${e.id}:${idx}`}
+                                type="button"
+                                className="ddItem"
+                                onClick={() => onPickEntity(e, idx + 1)}
+                              >
+                                <span className="ddBadge">{badgeForEntity(e)}</span>
+                                <span className="ddText">
+                                  <span className="ddName">{e.name}</span>
+                                  <span className="ddMeta">
+                                    {e.entity_type}
+                                    {e.city ? ` • ${e.city}` : ""}
+                                    {e.parent_name ? ` • ${e.parent_name}` : ""}
+                                  </span>
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  )}
+                </div>
               )}
-            </>
+            </div>
           )}
         </div>
-      )}
+      </div>
     </div>
   );
 }
