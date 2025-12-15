@@ -9,14 +9,29 @@ function baseUrl(): string {
   );
 }
 
-export function buildUrl(path: string, query?: Query): string {
-  const url = new URL(path, baseUrl());
+const API_PREFIX = process.env.NEXT_PUBLIC_API_PREFIX ?? "/api/v1";
+
+function normalizeApiPath(path: string): string {
+  // allow absolute URLs unchanged
+  if (/^https?:\/\//i.test(path)) return path;
+
+  // ensure leading slash
+  const p = path.startsWith("/") ? path : `/${path}`;
+
+  // already prefixed or already /api/...
+  if (p === API_PREFIX || p.startsWith(`${API_PREFIX}/`)) return p;
+  if (p.startsWith("/api/")) return p;
+
+  // default: prefix it
+  return `${API_PREFIX}${p}`;
+}
+
+function buildUrl(path: string, query?: Query): string {
+  const url = new URL(normalizeApiPath(path), baseUrl());
   if (query) {
     for (const [k, v] of Object.entries(query)) {
-      if (v === null || v === undefined) continue;
-      const s = String(v).trim();
-      if (!s) continue;
-      url.searchParams.set(k, s);
+      if (v === undefined || v === null || v === "") continue;
+      url.searchParams.set(k, String(v));
     }
   }
   return url.toString();
