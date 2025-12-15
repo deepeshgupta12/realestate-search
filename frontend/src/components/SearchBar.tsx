@@ -2,236 +2,386 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiGet, buildUrl } from "@/lib/api";
-import type { SuggestResponse, ZeroStateResponse, ResolveResponse, EntityOut } from "@/lib/types";
+import { apiGet } from "@/lib/api";
+import type { EntityOut, SuggestResponse, ZeroStateResponse, ResolveResponse } from "@/lib/types";
 
 type Props = {
-  placeholder?: string;
-  cityId?: string | null;
-  contextUrl?: string | null;
+  contextUrl?: string;
 };
 
-function subtitle(e: EntityOut) {
-  return [e.parent_name, e.city].filter(Boolean).join(" • ");
+type RecentItem = { q: string; cityId?: string; ts: number };
+
+function normalizeSpace(s: string) {
+  return (s || "").replace(/\s+/g, " ").trim();
 }
 
-export default function SearchBar({ placeholder = "Search localities, projects, builders…", cityId, contextUrl }: Props) {
+function badgeForEntityType(t: string) {
+  switch (t) {
+    case "city":
+      return "CITY";
+    case "micromarket":
+      return "MM";
+    case "locality":
+      return "LOC";
+    case "locality_overview":
+      return "OV";
+    case "listing_page":
+      return "LIST";
+    case "rate_page":
+      return "RATE";
+    case "project":
+      return "PROJ";
+    case "property_pdp":
+      return "PROP";
+    case "builder":
+    case "developer":
+      return "BLDR";
+    default:
+      return (t || "").toUpperCase().slice(0, 4) || "ITEM";
+  }
+}
+
+function readRecents(): RecentItem[] {
+  try {
+    const raw = localStorage.getItem("re_search_recents_v1");
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeRecents(items: RecentItem[]) {
+  try {
+    localStorage.setItem("re_search_recents_v1", JSON.stringify(items.slice(0, 8)));
+  } catch {
+    // ignore
+  }
+}
+
+export default function SearchBar({ contextUrl = "/" }: Props) {
   const router = useRouter();
 
   const [q, setQ] = useState("");
+  const [cityId, setCityId] = useState<string>("");
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
 
-  const [zero, setZero] = useState<ZeroStateResponse | null>(null);
+  const [loading, setLoading] = useState(false);
   const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
 
-  const abortRef = useRef<AbortController | null>(null);
+  const [trendingLoading, setTrendingLoading] = useState(false);
+  const [zeroState, setZeroState] = useState<ZeroStateResponse | null>(null);
 
-  const trimmed = q.trim();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const sections = useMemo(() => {
-    const s = suggest?.groups;
-    if (!s) return null;
-    return [
-      { title: "Locations", key: "locations" as const, items: s.locations || [] },
-      { title: "Projects", key: "projects" as const, items: s.projects || [] },
-      { title: "Builders", key: "builders" as const, items: s.builders || [] },
-      { title: "Property Rates", key: "rate_pages" as const, items: s.rate_pages || [] },
-      { title: "Properties", key: "property_pdps" as const, items: s.property_pdps || [] },
+  const qTrim = useMemo(() => normalizeSpace(q), [q]);
+
+  const recents = useMemo(() => {
+    if (typeof window === "undefined") return [];
+    const all = readRecents();
+    if (!cityId) return all;
+    return all.filter((r) => r.cityId === cityId);
+  }, [cityId]);
+
+  function pushRecent(query: string) {
+    if (typeof window === "undefined") return;
+    const cleaned = normalizeSpace(query);
+    if (!cleaned) return;
+
+    const now = Date.now();
+    const existing = readRecents();
+
+    const next: RecentItem[] = [
+      { q: cleaned, cityId: cityId || undefined, ts: now },
+      ...existing.filter((r) => !(r.q.toLowerCase() === cleaned.toLowerCase() && (r.cityId || "") === (cityId || ""))),
     ];
-  }, [suggest]);
 
-  useEffect(() => {
-    setOpen(true);
+    writeRecents(next);
+  }
 
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    const run = async () => {
-      setLoading(true);
-      try {
-        if (!trimmed) {
-          const z = await apiGet<ZeroStateResponse>(
-            buildUrl("/search/zero-state", {
-              limit: 8,
-              city_id: cityId || undefined,
-              context_url: contextUrl || undefined,
-            }),
-            { signal: ac.signal }
-          );
-          setZero(z);
-          setSuggest(null);
-        } else {
-          const s = await apiGet<SuggestResponse>(
-            buildUrl("/search/suggest", {
-              q: trimmed,
-              limit: 10,
-              city_id: cityId || undefined,
-              context_url: contextUrl || undefined,
-            }),
-            { signal: ac.signal }
-          );
-          setSuggest(s);
-          setZero(null);
-        }
-      } catch {
-        // swallow fetch aborts / network errors for local dev
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    const t = setTimeout(run, trimmed ? 120 : 0);
-    return () => clearTimeout(t);
-  }, [trimmed, cityId, contextUrl]);
-
-  const onPick = (e: EntityOut, rank: number) => {
-    // Route through /go (your existing flow logs click there)
-    const sp = new URLSearchParams();
-    sp.set("url", e.canonical_url);
-    sp.set("entity_id", e.id);
-    sp.set("entity_type", e.entity_type);
-    sp.set("rank", String(rank));
-    if (cityId) sp.set("city_id", cityId);
-    if (contextUrl) sp.set("context_url", contextUrl);
-    router.push(`/go?${sp.toString()}`);
+  function goToSerp(query: string) {
+    const cleaned = normalizeSpace(query);
+    const params = new URLSearchParams();
+    params.set("q", cleaned);
+    if (cityId) params.set("city_id", cityId);
+    router.push(`/search?${params.toString()}`);
     setOpen(false);
-  };
+  }
 
-  const onSubmit = async () => {
-    const raw = trimmed;
-    if (!raw) return;
+  function goToGo(targetUrl: string, rawQuery: string) {
+    const params = new URLSearchParams();
+    params.set("to", targetUrl);
+    params.set("q", rawQuery);
+    if (cityId) params.set("city_id", cityId);
+    if (contextUrl) params.set("context_url", contextUrl);
+    router.push(`/go?${params.toString()}`);
+    setOpen(false);
+  }
 
-    setLoading(true);
-    try {
-      const res = await apiGet<ResolveResponse>(
-        buildUrl("/search/resolve", {
-          q: raw,
-          city_id: cityId || undefined,
-          context_url: contextUrl || undefined,
-        })
-      );
-
-      // Prefer backend-provided URL when available
-      if (res.action === "redirect" && res.url) {
-        router.push(`/go?${new URLSearchParams({ url: res.url }).toString()}`);
-        return;
-      }
-
-      if (res.action === "disambiguate") {
-        const sp = new URLSearchParams();
-        sp.set("q", raw);
-        if (cityId) sp.set("city_id", cityId);
-        if (contextUrl) sp.set("context_url", contextUrl);
-        router.push(`/disambiguate?${sp.toString()}`);
-        return;
-      }
-
-      // serp fallback
-      if (res.url) {
-        router.push(res.url);
-      } else {
-        const sp = new URLSearchParams();
-        sp.set("q", raw);
-        if (cityId) sp.set("city_id", cityId);
-        router.push(`/search?${sp.toString()}`);
-      }
-    } finally {
-      setLoading(false);
+  // close dropdown on outside click
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      const el = containerRef.current;
+      if (!el) return;
+      if (e.target && el.contains(e.target as Node)) return;
       setOpen(false);
     }
-  };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  // zero-state (trending/recents) when dropdown opens and query empty
+  useEffect(() => {
+    if (!open) return;
+    if (qTrim) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        setTrendingLoading(true);
+        const res = await apiGet<ZeroStateResponse>("/api/v1/search/zero-state", {
+          limit: 8,
+          city_id: cityId || undefined,
+          context_url: contextUrl || undefined,
+        });
+        if (!cancelled) setZeroState(res);
+      } catch {
+        if (!cancelled) setZeroState(null);
+      } finally {
+        if (!cancelled) setTrendingLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, qTrim, cityId, contextUrl]);
+
+  // suggest when query changes
+  useEffect(() => {
+    if (!open) return;
+    if (!qTrim) {
+      setSuggest(null);
+      return;
+    }
+
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        setLoading(true);
+        const res = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
+          q: qTrim,
+          limit: 10,
+          city_id: cityId || undefined,
+          context_url: contextUrl || undefined,
+        });
+        if (!cancelled) setSuggest(res);
+      } catch {
+        if (!cancelled) setSuggest(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [qTrim, open, cityId, contextUrl]);
+
+  async function onSubmit(e?: React.FormEvent) {
+    e?.preventDefault();
+    const cleaned = normalizeSpace(q);
+    if (!cleaned) return;
+
+    pushRecent(cleaned);
+
+    try {
+      const res = await apiGet<ResolveResponse>("/api/v1/search/resolve", {
+        q: cleaned,
+        city_id: cityId || undefined,
+        context_url: contextUrl || undefined,
+      });
+
+      if (res.action === "redirect" && res.url) {
+        goToGo(res.url, cleaned);
+        return;
+      }
+
+      if (res.action === "serp" && res.url) {
+        router.push(res.url);
+        setOpen(false);
+        return;
+      }
+
+      // disambiguate currently routes to SERP; UI will be built in the next step
+      goToSerp(cleaned);
+    } catch {
+      goToSerp(cleaned);
+    }
+  }
+
+  function renderEntityRow(e: EntityOut) {
+    const badge = badgeForEntityType(e.entity_type);
+    const metaParts = [e.entity_type, e.city, e.parent_name].filter(Boolean);
+
+    return (
+      <button
+        key={e.id}
+        type="button"
+        className="item"
+        onClick={() => goToGo(e.canonical_url, qTrim)}
+      >
+        <div className="itemLeft">
+          <span className="badge">{badge}</span>
+        </div>
+        <div className="itemBody">
+          <div className="itemTitle">{e.name}</div>
+          <div className="itemMeta">{metaParts.join(" • ")}</div>
+        </div>
+      </button>
+    );
+  }
+
+  const groups = suggest?.groups;
+  const trending = zeroState?.trending_searches || [];
 
   return (
-    <div className="relative">
-      <div className="flex items-center gap-2 rounded border px-3 py-2">
+    <div ref={containerRef} className="searchWrap">
+      <form className="searchRow" onSubmit={onSubmit}>
+        <select className="select" value={cityId} onChange={(e) => setCityId(e.target.value)}>
+          <option value="">All Cities</option>
+          <option value="city_noida">Noida</option>
+          <option value="city_pune">Pune</option>
+        </select>
+
         <input
-          className="w-full outline-none bg-transparent"
+          ref={inputRef}
+          className="input"
           value={q}
-          placeholder={placeholder}
-          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search city, locality, project, builder, rates, properties..."
           onFocus={() => setOpen(true)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onSubmit();
-            if (e.key === "Escape") setOpen(false);
+          onChange={(e) => {
+            setQ(e.target.value);
+            setOpen(true);
           }}
         />
-        <button
-          className="text-sm rounded border px-3 py-1"
-          onClick={onSubmit}
-          disabled={loading || !trimmed}
-        >
+
+        <button className="btn" type="submit">
           Search
         </button>
-      </div>
+      </form>
 
-      {open ? (
-        <div className="absolute z-50 mt-2 w-full rounded border bg-white shadow">
-          <div className="px-3 py-2 text-xs opacity-70 flex items-center justify-between">
-            <span>{loading ? "Loading…" : trimmed ? "Suggestions" : "Trending"}</span>
-          </div>
+      {open && (
+        <div className="dropdown" role="listbox" aria-label="Search suggestions">
+          {!qTrim && (
+            <>
+              <div className="sectionTitle">Trending</div>
+              {trendingLoading ? (
+                <div className="empty">Loading…</div>
+              ) : trending.length === 0 ? (
+                <div className="empty">No trending items.</div>
+              ) : (
+                <div className="list">{trending.map(renderEntityRow)}</div>
+              )}
 
-          {/* Zero state */}
-          {!trimmed && zero ? (
-            <div className="divide-y">
-              {zero.trending_searches?.length ? (
-                <div className="p-2">
-                  <div className="px-2 py-1 text-xs font-semibold opacity-70">Trending</div>
-                  <div className="rounded border divide-y">
-                    {zero.trending_searches.map((e, idx) => (
+              {recents.length > 0 && (
+                <>
+                  <div className="sectionTitle">Recent searches</div>
+                  <div className="list">
+                    {recents.map((r, idx) => (
                       <button
-                        key={e.id}
-                        className="w-full text-left px-3 py-2 hover:bg-black/5"
-                        onClick={() => onPick(e, idx + 1)}
+                        key={`${r.q}|${r.cityId || ""}|${r.ts}|${idx}`}
+                        type="button"
+                        className="item"
+                        onClick={() => {
+                          setQ(r.q);
+                          if (r.cityId) setCityId(r.cityId);
+                          goToSerp(r.q);
+                        }}
                       >
-                        <div className="text-sm font-medium">{e.name}</div>
-                        <div className="text-xs opacity-70">{subtitle(e)}</div>
+                        <div className="itemLeft">
+                          <span className="badge">REC</span>
+                        </div>
+                        <div className="itemBody">
+                          <div className="itemTitle">{r.q}</div>
+                          <div className="itemMeta">{r.cityId ? `city_id • ${r.cityId}` : "All Cities"}</div>
+                        </div>
                       </button>
                     ))}
                   </div>
+                </>
+              )}
+            </>
+          )}
+
+          {qTrim && (
+            <>
+              {loading && <div className="empty">Searching…</div>}
+
+              {!loading && suggest?.did_you_mean && suggest.did_you_mean !== suggest.q && (
+                <div className="dym">
+                  Did you mean{" "}
+                  <button type="button" className="dymBtn" onClick={() => setQ(suggest.did_you_mean || "")}>
+                    {suggest.did_you_mean}
+                  </button>
+                  ?
                 </div>
-              ) : (
-                <div className="p-4 text-sm opacity-70">No trending items.</div>
-              )}
-            </div>
-          ) : null}
-
-          {/* Suggest */}
-          {trimmed && suggest && sections ? (
-            <div className="divide-y">
-              {sections.map((sec) =>
-                sec.items.length ? (
-                  <div key={sec.key} className="p-2">
-                    <div className="px-2 py-1 text-xs font-semibold opacity-70">{sec.title}</div>
-                    <div className="rounded border divide-y">
-                      {sec.items.map((e, idx) => (
-                        <button
-                          key={e.id}
-                          className="w-full text-left px-3 py-2 hover:bg-black/5"
-                          onClick={() => onPick(e, idx + 1)}
-                        >
-                          <div className="text-sm font-medium">{e.name}</div>
-                          <div className="text-xs opacity-70">{subtitle(e)}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null
               )}
 
-              <div className="p-2">
-                <button
-                  className="w-full text-left px-3 py-2 hover:bg-black/5 text-sm"
-                  onClick={onSubmit}
-                >
-                  See all results for “{trimmed}”
-                </button>
-              </div>
-            </div>
-          ) : null}
+              {!loading && groups && (
+                <>
+                  {groups.locations?.length > 0 && (
+                    <>
+                      <div className="sectionTitle">Locations</div>
+                      <div className="list">{groups.locations.map(renderEntityRow)}</div>
+                    </>
+                  )}
+
+                  {groups.projects?.length > 0 && (
+                    <>
+                      <div className="sectionTitle">Projects</div>
+                      <div className="list">{groups.projects.map(renderEntityRow)}</div>
+                    </>
+                  )}
+
+                  {groups.builders?.length > 0 && (
+                    <>
+                      <div className="sectionTitle">Builders</div>
+                      <div className="list">{groups.builders.map(renderEntityRow)}</div>
+                    </>
+                  )}
+
+                  {groups.rate_pages?.length > 0 && (
+                    <>
+                      <div className="sectionTitle">Property Rates</div>
+                      <div className="list">{groups.rate_pages.map(renderEntityRow)}</div>
+                    </>
+                  )}
+
+                  {groups.property_pdps?.length > 0 && (
+                    <>
+                      <div className="sectionTitle">Properties</div>
+                      <div className="list">{groups.property_pdps.map(renderEntityRow)}</div>
+                    </>
+                  )}
+
+                  {Object.values(groups).every((arr) => !arr || arr.length === 0) && (
+                    <div className="empty">No results found. Try a different spelling or choose from trending.</div>
+                  )}
+                </>
+              )}
+
+              <button type="button" className="seeAll" onClick={() => goToSerp(qTrim)}>
+                See all results for "{qTrim}"
+              </button>
+            </>
+          )}
         </div>
-      ) : null}
+      )}
     </div>
   );
 }
