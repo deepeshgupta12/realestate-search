@@ -1,47 +1,41 @@
+// frontend/src/lib/api.ts
 type Query = Record<string, string | number | boolean | null | undefined>;
 
-function baseUrl(): string {
-  // Avoid localhost -> IPv6 issues in Node fetch; prefer 127.0.0.1 by default.
-  return (
-    process.env.NEXT_PUBLIC_API_BASE_URL ||
-    process.env.API_BASE_URL ||
-    "http://127.0.0.1:8000"
-  );
+function baseUrl() {
+  // Use env if you want later; keep default stable for local.
+  return process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
 }
 
-const API_PREFIX = process.env.NEXT_PUBLIC_API_PREFIX ?? "/api/v1";
-
-function normalizeApiPath(path: string): string {
-  // allow absolute URLs unchanged
-  if (/^https?:\/\//i.test(path)) return path;
-
-  // ensure leading slash
-  const p = path.startsWith("/") ? path : `/${path}`;
-
-  // already prefixed or already /api/...
-  if (p === API_PREFIX || p.startsWith(`${API_PREFIX}/`)) return p;
-  if (p.startsWith("/api/")) return p;
-
-  // default: prefix it
-  return `${API_PREFIX}${p}`;
-}
-
-function buildUrl(path: string, query?: Query): string {
-  const url = new URL(normalizeApiPath(path), baseUrl());
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v === undefined || v === null || v === "") continue;
-      url.searchParams.set(k, String(v));
-    }
+function withQuery(path: string, query?: Query) {
+  if (!query) return path;
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) {
+    if (v === null || v === undefined) continue;
+    sp.set(k, String(v));
   }
-  return url.toString();
+  const qs = sp.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 export async function apiGet<T>(path: string, query?: Query): Promise<T> {
-  const res = await fetch(buildUrl(path, query), { cache: "no-store" });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`GET ${path} failed: ${res.status} ${text}`);
-  }
+  const url = baseUrl() + withQuery(path, query);
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status} ${await res.text()}`);
   return (await res.json()) as T;
+}
+
+export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const url = baseUrl() + path;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`POST ${path} failed: ${res.status} ${await res.text()}`);
+  return (await res.json()) as T;
+}
+
+// Non-blocking helper (we never want events to break UX)
+export function fireAndForget(p: Promise<unknown>) {
+  p.catch(() => {});
 }
