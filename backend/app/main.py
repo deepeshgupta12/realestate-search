@@ -72,11 +72,12 @@ class SuggestResponse(BaseModel):
 
 
 class ResolveResponse(BaseModel):
-    action: str  # redirect | serp
+    action: str  # redirect | serp | disambiguate
     query: str
     normalized_query: str
     url: Optional[str] = None
     match: Optional[EntityOut] = None
+    candidates: Optional[List[EntityOut]] = None
     reason: Optional[str] = None
     debug: Optional[Dict[str, Any]] = None
 
@@ -404,6 +405,12 @@ def _append_jsonl(path: Path, payload: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+def build_serp_url(q: str, city_id: Optional[str] = None) -> str:
+    u = f"/search?q={quote_plus(q)}"
+    if city_id:
+        u += f"&city_id={quote_plus(city_id)}"
+    return u
+
 
 # -----------------------
 # App + Routers
@@ -523,10 +530,9 @@ def suggest(
         },
     )
 
-
 @search.get("/resolve", response_model=ResolveResponse)
 def resolve(q: str, city_id: Optional[str] = None):
-    # if query has constraints -> send to SERP with a URL
+    # Constraint-heavy queries always go to SERP (but with a URL now)
     if is_constraint_heavy(q):
         return ResolveResponse(
             action="serp",
@@ -536,7 +542,8 @@ def resolve(q: str, city_id: Optional[str] = None):
             reason="constraint_heavy",
         )
 
-    hits, _ = es_search_entities(q=q, limit=5, city_id=city_id)
+    hits, _ = es_search_entities(q=q, limit=8, city_id=city_id)
+
     if not hits:
         return ResolveResponse(
             action="serp",
@@ -546,14 +553,40 @@ def resolve(q: str, city_id: Optional[str] = None):
             reason="no_results",
         )
 
+    # Convert hits -> entities
+    entities = [hit_to_entity(h) for h in hits]
     top = hits[0]
     second = hits[1] if len(hits) > 1 else None
+
     top_score = float(top.get("_score") or 0.0)
     second_score = float(second.get("_score") or 0.0) if second else 0.0
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
 
-    match = hit_to_entity(top)
+    top_entity = entities[0]
+
+    # ---- Disambiguation rule #1: same-name collisions (only when city_id is NOT provided)
+    # Example: "Baner" exists in multiple cities (or multiple localities/projects)
+    if not city_id and len(entities) >= 2:
+        top_name_norm = normalize_q(top_entity.name)
+        same_name = [
+            e for e in entities
+            if normalize_q(e.name) == top_name_norm
+            and e.entity_type in ("locality", "micromarket", "project", "city")
+        ]
+        # If we found multiple same-name candidates, force disambiguation UI
+        if len(same_name) >= 2:
+            return ResolveResponse(
+                action="disambiguate",
+                query=q,
+                normalized_query=q,
+                candidates=same_name[:6],
+                reason="same_name",
+                debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+            )
+
+    # ---- Confident redirect (existing logic)
     # threshold tuned for demo; refine later with evals
+    match = top_entity
     if top_score >= 5.0 and gap >= 0.30:
         return ResolveResponse(
             action="redirect",
@@ -564,6 +597,19 @@ def resolve(q: str, city_id: Optional[str] = None):
             debug={"top_score": top_score, "second_score": second_score, "gap": gap},
         )
 
+    # ---- Disambiguation rule #2: close-call ambiguity (top2 too close)
+    # If the top results are close, send candidates to disambiguation instead of SERP
+    if len(entities) >= 2 and gap < 0.25:
+        return ResolveResponse(
+            action="disambiguate",
+            query=q,
+            normalized_query=q,
+            candidates=entities[:6],
+            reason="ambiguous_close_scores",
+            debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+        )
+
+    # Default → SERP (with URL)
     return ResolveResponse(
         action="serp",
         query=q,
