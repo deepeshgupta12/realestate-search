@@ -8,13 +8,12 @@ export type EntityType =
   | "project"
   | "property_pdp"
   | "builder"
-  | "developer";
+  | "developer"
+  | string;
 
-export type ResolveAction = "redirect" | "serp" | "disambiguate";
-
-export interface EntityOut {
+export type EntityOut = {
   id: string;
-  entity_type: EntityType | string;
+  entity_type: EntityType;
   name: string;
   city?: string;
   city_id?: string;
@@ -22,28 +21,37 @@ export interface EntityOut {
   canonical_url: string;
   score?: number | null;
   popularity_score?: number | null;
-}
+};
 
-export interface SuggestResponse {
+export type SuggestResponse = {
   q: string;
   normalized_q: string;
-  did_you_mean?: string | null;
+  did_you_mean: string | null;
   groups: {
     locations: EntityOut[];
     projects: EntityOut[];
     builders: EntityOut[];
     rate_pages: EntityOut[];
     property_pdps: EntityOut[];
+    [k: string]: EntityOut[];
   };
   fallbacks?: {
-    relaxed_used: boolean;
-    trending: EntityOut[];
+    relaxed_used?: boolean;
+    trending?: EntityOut[];
     reason?: string | null;
   } | null;
-}
+};
 
-export interface ResolveResponse {
-  action: ResolveAction;
+export type ZeroStateResponse = {
+  city_id: string | null;
+  recent_searches: EntityOut[];
+  trending_searches: EntityOut[];
+  trending_localities: EntityOut[];
+  popular_entities: EntityOut[];
+};
+
+export type ResolveResponse = {
+  action: "redirect" | "serp" | "disambiguate";
   query: string;
   normalized_query: string;
   url?: string | null;
@@ -51,16 +59,4 @@ export interface ResolveResponse {
   candidates?: EntityOut[] | null;
   reason?: string | null;
   debug?: Record<string, any> | null;
-}
-
-export interface ZeroStateResponse {
-  city_id: string | null;
-  recent_searches: string[];
-  trending_searches: EntityOut[];
-  trending_localities: EntityOut[];
-  popular_entities: EntityOut[];
-}
-
-export interface EventsOkResponse {
-  ok: boolean;
-}
+};

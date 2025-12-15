@@ -2,8 +2,8 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiGet } from "@/lib/api";
-import type { EntityOut, SuggestResponse, ZeroStateResponse, ResolveResponse } from "@/lib/types";
+import { apiGet, buildUrl } from "@/lib/api";
+import type { SuggestResponse, ZeroStateResponse, ResolveResponse, EntityOut } from "@/lib/types";
 
 type Props = {
   placeholder?: string;
@@ -11,27 +11,11 @@ type Props = {
   contextUrl?: string | null;
 };
 
-type FlatItem =
-  | ({ kind: "entity"; group: keyof SuggestResponse["groups"] } & EntityOut)
-  | { kind: "query"; group: "queries"; text: string }
-  | { kind: "trending"; group: "trending"; text: string };
-
-function normalizeInput(s: string): string {
-  return s.trim().replace(/\s+/g, " ");
+function subtitle(e: EntityOut) {
+  return [e.parent_name, e.city].filter(Boolean).join(" • ");
 }
 
-function apiAbsUrl(path: string) {
-  const base = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
-  if (path.startsWith("http://") || path.startsWith("https://")) return path;
-  if (!path.startsWith("/")) return `${base}/${path}`;
-  return `${base}${path}`;
-}
-
-export default function SearchBar({
-  placeholder = "Search projects, localities, builders…",
-  cityId,
-  contextUrl,
-}: Props) {
+export default function SearchBar({ placeholder = "Search localities, projects, builders…", cityId, contextUrl }: Props) {
   const router = useRouter();
 
   const [q, setQ] = useState("");
@@ -41,359 +25,213 @@ export default function SearchBar({
   const [zero, setZero] = useState<ZeroStateResponse | null>(null);
   const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
 
-  const [highlight, setHighlight] = useState(0);
-  const [currentQid, setCurrentQid] = useState<string | null>(null);
-
-  const inputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const flatItems: FlatItem[] = useMemo(() => {
-    const items: FlatItem[] = [];
-    const nq = normalizeInput(q);
+  const trimmed = q.trim();
 
-    if (!nq) {
-      const z = zero;
-      if (!z) return items;
-
-      if (z.recent_searches?.length) {
-        for (const t of z.recent_searches) {
-          items.push({ kind: "query", group: "queries", text: t });
-        }
-      }
-
-      if (z.trending_searches?.length) {
-        for (const e of z.trending_searches) {
-          items.push({ kind: "entity", group: "locations", ...e });
-        }
-      }
-      return items;
-    }
-
-    const s = suggest;
-    if (!s) return items;
-
-    const groups = s.groups;
-    (Object.keys(groups) as (keyof SuggestResponse["groups"])[]).forEach((g) => {
-      for (const e of groups[g]) {
-        items.push({ kind: "entity", group: g, ...e });
-      }
-    });
-
-    return items;
-  }, [q, zero, suggest]);
-
-  async function logSearch(qid: string, raw: string) {
-    const payload = {
-      query_id: qid,
-      raw_query: raw,
-      normalized_query: normalizeInput(raw).toLowerCase(),
-      city_id: cityId ?? null,
-      context_url: contextUrl ?? "/",
-      timestamp: new Date().toISOString(),
-    };
-
-    const res = await fetch(apiAbsUrl("/api/v1/events/search"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      console.warn("events/search failed:", res.status);
-    }
-  }
-
-  function goToUrl(url: string, opts?: { qid?: string; entity?: EntityOut; rank?: number }) {
-    const qid = opts?.qid ?? currentQid ?? undefined;
-
-    const params = new URLSearchParams();
-    params.set("url", url);
-
-    if (qid) params.set("qid", qid);
-    if (opts?.entity?.id) params.set("entity_id", opts.entity.id);
-    if (opts?.entity?.entity_type) params.set("entity_type", String(opts.entity.entity_type));
-    if (typeof opts?.rank === "number") params.set("rank", String(opts.rank));
-
-    if (cityId) params.set("city_id", cityId);
-    if (contextUrl) params.set("context_url", contextUrl);
-
-    router.push(`/go?${params.toString()}`);
-  }
-
-  function goToSerpUrl(url: string, qid?: string) {
-    const joiner = url.includes("?") ? "&" : "?";
-    router.push(`${url}${qid ? `${joiner}qid=${encodeURIComponent(qid)}` : ""}`);
-  }
-
-  async function submitQuery(raw: string) {
-    const clean = normalizeInput(raw);
-    if (!clean) return;
-
-    const qid = crypto.randomUUID();
-    setCurrentQid(qid);
-
-    await logSearch(qid, clean);
-
-    try {
-      const rr = await apiGet<ResolveResponse>("/api/v1/search/resolve", {
-        q: clean,
-        city_id: cityId ?? undefined,
-      });
-
-      if (rr.action === "redirect" && rr.url) {
-        goToUrl(rr.url, { qid, entity: rr.match ?? undefined, rank: 1 });
-        return;
-      }
-
-      if (rr.action === "disambiguate") {
-        const url =
-          `/disambiguate?q=${encodeURIComponent(clean)}` +
-          (cityId ? `&city_id=${encodeURIComponent(cityId)}` : "") +
-          `&qid=${encodeURIComponent(qid)}` +
-          (contextUrl ? `&context_url=${encodeURIComponent(contextUrl)}` : "");
-        router.push(url);
-        return;
-      }
-
-      if (rr.url) {
-        goToSerpUrl(rr.url, qid);
-        return;
-      }
-
-      goToSerpUrl(
-        `/search?q=${encodeURIComponent(clean)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`,
-        qid
-      );
-    } catch (e) {
-      console.warn("resolve failed, falling back to SERP", e);
-      goToSerpUrl(
-        `/search?q=${encodeURIComponent(clean)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`,
-        qid
-      );
-    }
-  }
+  const sections = useMemo(() => {
+    const s = suggest?.groups;
+    if (!s) return null;
+    return [
+      { title: "Locations", key: "locations" as const, items: s.locations || [] },
+      { title: "Projects", key: "projects" as const, items: s.projects || [] },
+      { title: "Builders", key: "builders" as const, items: s.builders || [] },
+      { title: "Property Rates", key: "rate_pages" as const, items: s.rate_pages || [] },
+      { title: "Properties", key: "property_pdps" as const, items: s.property_pdps || [] },
+    ];
+  }, [suggest]);
 
   useEffect(() => {
-    if (!open) return;
-    const clean = normalizeInput(q);
-    if (clean) return;
+    setOpen(true);
 
-    let cancelled = false;
-    setLoading(true);
-
-    apiGet<ZeroStateResponse>("/api/v1/search/zero-state", {
-      city_id: cityId ?? undefined,
-      context_url: contextUrl ?? undefined,
-      limit: 8,
-    })
-      .then((z) => {
-        if (!cancelled) setZero(z);
-      })
-      .catch((e) => console.warn("zero-state failed", e))
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [open, q, cityId, contextUrl]);
-
-  useEffect(() => {
-    const clean = normalizeInput(q);
-    if (!open) return;
-
-    setHighlight(0);
-
-    if (!clean) {
-      setSuggest(null);
-      return;
-    }
-
-    if (abortRef.current) abortRef.current.abort();
+    abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
 
-    setLoading(true);
+    const run = async () => {
+      setLoading(true);
+      try {
+        if (!trimmed) {
+          const z = await apiGet<ZeroStateResponse>(
+            buildUrl("/search/zero-state", {
+              limit: 8,
+              city_id: cityId || undefined,
+              context_url: contextUrl || undefined,
+            }),
+            { signal: ac.signal }
+          );
+          setZero(z);
+          setSuggest(null);
+        } else {
+          const s = await apiGet<SuggestResponse>(
+            buildUrl("/search/suggest", {
+              q: trimmed,
+              limit: 10,
+              city_id: cityId || undefined,
+              context_url: contextUrl || undefined,
+            }),
+            { signal: ac.signal }
+          );
+          setSuggest(s);
+          setZero(null);
+        }
+      } catch {
+        // swallow fetch aborts / network errors for local dev
+      } finally {
+        setLoading(false);
+      }
+    };
 
-    apiGet<SuggestResponse>("/api/v1/search/suggest", {
-      q: clean,
-      city_id: cityId ?? undefined,
-      context_url: contextUrl ?? undefined,
-      limit: 10,
-    })
-      .then((s) => {
-        if (!ac.signal.aborted) setSuggest(s);
-      })
-      .catch((e) => {
-        if (!ac.signal.aborted) console.warn("suggest failed", e);
-      })
-      .finally(() => {
-        if (!ac.signal.aborted) setLoading(false);
-      });
+    const t = setTimeout(run, trimmed ? 120 : 0);
+    return () => clearTimeout(t);
+  }, [trimmed, cityId, contextUrl]);
 
-    return () => ac.abort();
-  }, [q, open, cityId, contextUrl]);
-
-  function selectItem(item: FlatItem, rank: number) {
-    if (item.kind === "entity") {
-      const qid = currentQid ?? crypto.randomUUID();
-      setCurrentQid(qid);
-
-      goToUrl(item.canonical_url, {
-        qid,
-        entity: {
-          id: item.id,
-          entity_type: item.entity_type,
-          name: item.name,
-          city: item.city,
-          city_id: item.city_id,
-          parent_name: item.parent_name,
-          canonical_url: item.canonical_url,
-          score: item.score ?? null,
-          popularity_score: item.popularity_score ?? null,
-        },
-        rank,
-      });
-
-      setOpen(false);
-      return;
-    }
-
-    const text = item.kind === "query" || item.kind === "trending" ? item.text : "";
-    setQ(text);
+  const onPick = (e: EntityOut, rank: number) => {
+    // Route through /go (your existing flow logs click there)
+    const sp = new URLSearchParams();
+    sp.set("url", e.canonical_url);
+    sp.set("entity_id", e.id);
+    sp.set("entity_type", e.entity_type);
+    sp.set("rank", String(rank));
+    if (cityId) sp.set("city_id", cityId);
+    if (contextUrl) sp.set("context_url", contextUrl);
+    router.push(`/go?${sp.toString()}`);
     setOpen(false);
-    submitQuery(text);
-  }
+  };
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (!open) return;
+  const onSubmit = async () => {
+    const raw = trimmed;
+    if (!raw) return;
 
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setHighlight((h) => Math.min(h + 1, Math.max(flatItems.length - 1, 0)));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setHighlight((h) => Math.max(h - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const item = flatItems[highlight];
-      if (item) selectItem(item, highlight + 1);
-      else submitQuery(q);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
+    setLoading(true);
+    try {
+      const res = await apiGet<ResolveResponse>(
+        buildUrl("/search/resolve", {
+          q: raw,
+          city_id: cityId || undefined,
+          context_url: contextUrl || undefined,
+        })
+      );
+
+      // Prefer backend-provided URL when available
+      if (res.action === "redirect" && res.url) {
+        router.push(`/go?${new URLSearchParams({ url: res.url }).toString()}`);
+        return;
+      }
+
+      if (res.action === "disambiguate") {
+        const sp = new URLSearchParams();
+        sp.set("q", raw);
+        if (cityId) sp.set("city_id", cityId);
+        if (contextUrl) sp.set("context_url", contextUrl);
+        router.push(`/disambiguate?${sp.toString()}`);
+        return;
+      }
+
+      // serp fallback
+      if (res.url) {
+        router.push(res.url);
+      } else {
+        const sp = new URLSearchParams();
+        sp.set("q", raw);
+        if (cityId) sp.set("city_id", cityId);
+        router.push(`/search?${sp.toString()}`);
+      }
+    } finally {
+      setLoading(false);
       setOpen(false);
     }
-  }
+  };
 
   return (
-    <div
-      className="searchWrap"
-      onBlur={(e) => {
-        const next = e.relatedTarget as HTMLElement | null;
-        if (next && e.currentTarget.contains(next)) return;
-        setOpen(false);
-      }}
-    >
-      <form
-        className="searchForm"
-        onSubmit={(e) => {
-          e.preventDefault();
-          submitQuery(q);
-        }}
-      >
+    <div className="relative">
+      <div className="flex items-center gap-2 rounded border px-3 py-2">
         <input
-          ref={inputRef}
-          className="searchInput"
+          className="w-full outline-none bg-transparent"
           value={q}
           placeholder={placeholder}
-          onFocus={() => setOpen(true)}
           onChange={(e) => setQ(e.target.value)}
-          onKeyDown={onKeyDown}
-          aria-label="Search"
+          onFocus={() => setOpen(true)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSubmit();
+            if (e.key === "Escape") setOpen(false);
+          }}
         />
-        <button className="searchBtn" type="submit">
+        <button
+          className="text-sm rounded border px-3 py-1"
+          onClick={onSubmit}
+          disabled={loading || !trimmed}
+        >
           Search
         </button>
-      </form>
+      </div>
 
-      {open && (
-        <div className="dropdown" role="listbox" aria-label="Search suggestions">
-          {loading && <div className="dropdownRow muted">Loading…</div>}
+      {open ? (
+        <div className="absolute z-50 mt-2 w-full rounded border bg-white shadow">
+          <div className="px-3 py-2 text-xs opacity-70 flex items-center justify-between">
+            <span>{loading ? "Loading…" : trimmed ? "Suggestions" : "Trending"}</span>
+          </div>
 
-          {!loading && normalizeInput(q) && suggest?.did_you_mean && (
-            <button
-              type="button"
-              className="dropdownRow"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => submitQuery(suggest.did_you_mean || "")}
-            >
-              <span className="muted">Did you mean</span>{" "}
-              <span style={{ fontWeight: 600 }}>{suggest.did_you_mean}</span>
-            </button>
-          )}
+          {/* Zero state */}
+          {!trimmed && zero ? (
+            <div className="divide-y">
+              {zero.trending_searches?.length ? (
+                <div className="p-2">
+                  <div className="px-2 py-1 text-xs font-semibold opacity-70">Trending</div>
+                  <div className="rounded border divide-y">
+                    {zero.trending_searches.map((e, idx) => (
+                      <button
+                        key={e.id}
+                        className="w-full text-left px-3 py-2 hover:bg-black/5"
+                        onClick={() => onPick(e, idx + 1)}
+                      >
+                        <div className="text-sm font-medium">{e.name}</div>
+                        <div className="text-xs opacity-70">{subtitle(e)}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 text-sm opacity-70">No trending items.</div>
+              )}
+            </div>
+          ) : null}
 
-          {!loading && flatItems.length === 0 && <div className="dropdownRow muted">No suggestions</div>}
-
-          {!loading &&
-            flatItems.map((item, idx) => {
-              const active = idx === highlight;
-
-              if (item.kind === "entity") {
-                return (
-                  <button
-                    key={`${item.kind}-${item.id}-${idx}`}
-                    type="button"
-                    className={`dropdownRow ${active ? "active" : ""}`}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => selectItem(item, idx + 1)}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                      <div>
-                        <div style={{ fontWeight: 600 }}>{item.name}</div>
-                        <div className="meta">
-                          {item.entity_type}
-                          {item.city ? ` • ${item.city}` : ""}
-                          {item.parent_name ? ` • ${item.parent_name}` : ""}
-                        </div>
-                      </div>
-                      {item.city && <span className="pill">{item.city}</span>}
+          {/* Suggest */}
+          {trimmed && suggest && sections ? (
+            <div className="divide-y">
+              {sections.map((sec) =>
+                sec.items.length ? (
+                  <div key={sec.key} className="p-2">
+                    <div className="px-2 py-1 text-xs font-semibold opacity-70">{sec.title}</div>
+                    <div className="rounded border divide-y">
+                      {sec.items.map((e, idx) => (
+                        <button
+                          key={e.id}
+                          className="w-full text-left px-3 py-2 hover:bg-black/5"
+                          onClick={() => onPick(e, idx + 1)}
+                        >
+                          <div className="text-sm font-medium">{e.name}</div>
+                          <div className="text-xs opacity-70">{subtitle(e)}</div>
+                        </button>
+                      ))}
                     </div>
-                  </button>
-                );
-              }
+                  </div>
+                ) : null
+              )}
 
-              const text = item.text;
-              return (
+              <div className="p-2">
                 <button
-                  key={`${item.kind}-${text}-${idx}`}
-                  type="button"
-                  className={`dropdownRow ${active ? "active" : ""}`}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => selectItem(item, idx + 1)}
+                  className="w-full text-left px-3 py-2 hover:bg-black/5 text-sm"
+                  onClick={onSubmit}
                 >
-                  <span>{text}</span>
+                  See all results for “{trimmed}”
                 </button>
-              );
-            })}
-
-          {!loading && normalizeInput(q) && (
-            <button
-              type="button"
-              className="dropdownRow"
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                const clean = normalizeInput(q);
-                const url = `/search?q=${encodeURIComponent(clean)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`;
-                router.push(url);
-                setOpen(false);
-              }}
-            >
-              See all results for <strong>“{normalizeInput(q)}”</strong>
-            </button>
-          )}
+              </div>
+            </div>
+          ) : null}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
