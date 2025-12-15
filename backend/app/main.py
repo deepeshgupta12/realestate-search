@@ -13,7 +13,7 @@ from fastapi import FastAPI, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import NotFoundError
+from elasticsearch.exceptions import NotFoundError  # noqa: F401
 
 # -----------------------
 # Config
@@ -28,6 +28,7 @@ ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
 
 REQUEST_TIMEOUT = float(os.getenv("ES_REQUEST_TIMEOUT", "3.0"))
+MIN_RESULT_SCORE = float(os.getenv("MIN_RESULT_SCORE", "1.2"))  # below this, treat as no-results
 
 
 def get_es() -> Elasticsearch:
@@ -83,6 +84,13 @@ class ResolveResponse(BaseModel):
 class TrendingResponse(BaseModel):
     city_id: Optional[str]
     items: List[EntityOut]
+
+
+class ZeroStateResponse(BaseModel):
+    city_id: Optional[str]
+    recent_searches: List[str] = []
+    trending: List[EntityOut] = []
+    popular_entities: List[EntityOut] = []
 
 
 class AdminOk(BaseModel):
@@ -358,7 +366,6 @@ def group_entities(entities: List[EntityOut]) -> Dict[str, List[EntityOut]]:
 
 def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     if city_id:
-        # include global items too by OR-ing empty city_id
         q = {
             "bool": {
                 "should": [
@@ -383,11 +390,12 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(q: str, city_id: Optional[str]) -> str:
-    url = f"/search?q={quote_plus(q)}"
+def build_serp_url(q: str, city_id: Optional[str] = None) -> str:
+    # frontend SERP route is /search?q=...
+    base = f"/search?q={quote_plus(q)}"
     if city_id:
-        url += f"&city_id={quote_plus(city_id)}"
-    return url
+        base += f"&city_id={quote_plus(city_id)}"
+    return base
 
 EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "backend/.events"))
 
@@ -459,11 +467,14 @@ def search_serp(
     limit: int = 10,
 ):
     hits, did_you_mean = es_search_entities(q=q, limit=limit, city_id=city_id)
+    max_score = max((float(h.get("_score") or 0.0) for h in hits), default=0.0)
     entities = [hit_to_entity(h) for h in hits]
     groups = group_entities(entities)
 
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
-    if sum(len(v) for v in groups.values()) == 0:
+    # If we only have very low-confidence fuzzy hits, treat it as a no-results state.
+    if (not hits) or (max_score < MIN_RESULT_SCORE) or (sum(len(v) for v in groups.values()) == 0):
+        groups = {k: [] for k in groups.keys()}
         fallbacks["relaxed_used"] = True
         fallbacks["reason"] = "no_results"
         fallbacks["trending"] = fetch_trending(city_id=city_id, limit=8)
@@ -488,11 +499,14 @@ def suggest(
     limit: int = 10,
 ):
     hits, did_you_mean = es_search_entities(q=q, limit=limit, city_id=city_id)
+    max_score = max((float(h.get("_score") or 0.0) for h in hits), default=0.0)
     entities = [hit_to_entity(h) for h in hits]
     groups = group_entities(entities)
 
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
-    if sum(len(v) for v in groups.values()) == 0:
+    # If we only have very low-confidence fuzzy hits, treat it as a no-results state.
+    if (not hits) or (max_score < MIN_RESULT_SCORE) or (sum(len(v) for v in groups.values()) == 0):
+        groups = {k: [] for k in groups.keys()}
         fallbacks["relaxed_used"] = True
         fallbacks["reason"] = "no_results"
         fallbacks["trending"] = fetch_trending(city_id=city_id, limit=8)
@@ -511,17 +525,14 @@ def suggest(
 
 
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(
-    q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-):
-    # if query has constraints -> send to SERP (ALWAYS include url)
+def resolve(q: str, city_id: Optional[str] = None):
+    # if query has constraints -> send to SERP with a URL
     if is_constraint_heavy(q):
         return ResolveResponse(
             action="serp",
             query=q,
             normalized_query=q,
-            url=build_serp_url(q, city_id),
+            url=build_serp_url(q, city_id=city_id),
             reason="constraint_heavy",
         )
 
@@ -531,7 +542,7 @@ def resolve(
             action="serp",
             query=q,
             normalized_query=q,
-            url=build_serp_url(q, city_id),
+            url=build_serp_url(q, city_id=city_id),
             reason="no_results",
         )
 
@@ -542,6 +553,7 @@ def resolve(
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
 
     match = hit_to_entity(top)
+    # threshold tuned for demo; refine later with evals
     if top_score >= 5.0 and gap >= 0.30:
         return ResolveResponse(
             action="redirect",
@@ -556,10 +568,20 @@ def resolve(
         action="serp",
         query=q,
         normalized_query=q,
-        url=build_serp_url(q, city_id),
+        url=build_serp_url(q, city_id=city_id),
         reason="ambiguous",
         debug={"top_score": top_score, "second_score": second_score, "gap": gap},
     )
+
+
+@search.get("/zero-state", response_model=ZeroStateResponse)
+def zero_state(city_id: Optional[str] = None, limit: int = 8):
+    """Zero-state payload for an empty search box.
+
+    Note: recents are currently maintained client-side (localStorage).
+    """
+    items = fetch_trending(city_id=city_id, limit=limit)
+    return ZeroStateResponse(city_id=city_id, recent_searches=[], trending=items, popular_entities=items)
 
 
 @search.get("/trending", response_model=TrendingResponse)
@@ -588,3 +610,4 @@ def log_click(evt: ClickEventIn):
 app.include_router(admin, prefix="/api/v1/admin")
 app.include_router(search, prefix="/api/v1/search")
 app.include_router(events, prefix="/api/v1/events")
+app.include_router(search, prefix="/api/v1/search")
