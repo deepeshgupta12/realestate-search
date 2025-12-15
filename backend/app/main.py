@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
+from pathlib import Path
+
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -100,6 +104,28 @@ class ParseResponse(BaseModel):
     currency: str = "INR"
     ok: bool = True
 
+class EventOk(BaseModel):
+    ok: bool = True
+
+
+class SearchEventIn(BaseModel):
+    query_id: str
+    raw_query: str
+    normalized_query: str
+    city_id: Optional[str] = None
+    context_url: Optional[str] = None
+    timestamp: str  # ISO string
+
+
+class ClickEventIn(BaseModel):
+    query_id: str
+    entity_id: str
+    entity_type: str
+    rank: Optional[int] = None
+    url: str
+    city_id: Optional[str] = None
+    context_url: Optional[str] = None
+    timestamp: str  # ISO string
 
 # -----------------------
 # Helpers
@@ -363,6 +389,13 @@ def build_serp_url(q: str, city_id: Optional[str]) -> str:
         url += f"&city_id={quote_plus(city_id)}"
     return url
 
+EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "backend/.events"))
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
 
 # -----------------------
 # App + Routers
@@ -379,6 +412,7 @@ app.add_middleware(
 
 admin = APIRouter()
 search = APIRouter()
+events = APIRouter()
 
 
 @app.get("/health")
@@ -538,7 +572,19 @@ def trending(city_id: Optional[str] = None, limit: int = 5):
 def parse(q: str = Query(..., min_length=1)):
     return parse_query(q)
 
+@events.post("/search", response_model=EventOk)
+def log_search(evt: SearchEventIn):
+    _append_jsonl(EVENTS_DIR / "search.jsonl", evt.model_dump())
+    return EventOk(ok=True)
+
+
+@events.post("/click", response_model=EventOk)
+def log_click(evt: ClickEventIn):
+    _append_jsonl(EVENTS_DIR / "click.jsonl", evt.model_dump())
+    return EventOk(ok=True)
+
 
 # Mount routers
 app.include_router(admin, prefix="/api/v1/admin")
 app.include_router(search, prefix="/api/v1/search")
+app.include_router(events, prefix="/api/v1/events")
