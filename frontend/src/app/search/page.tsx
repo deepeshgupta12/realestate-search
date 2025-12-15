@@ -1,52 +1,11 @@
 import Link from "next/link";
-
-type EntityType =
-  | "city"
-  | "micromarket"
-  | "locality"
-  | "listing_page"
-  | "locality_overview"
-  | "rate_page"
-  | "project"
-  | "builder"
-  | "developer"
-  | "property_pdp"
-  | string;
-
-type EntityOut = {
-  id: string;
-  entity_type: EntityType;
-  name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
-  canonical_url: string;
-  score?: number | null;
-  popularity_score?: number | null;
-};
-
-type SearchResponse = {
-  q: string;
-  normalized_q: string;
-  did_you_mean: string | null;
-  groups: {
-    locations: EntityOut[];
-    projects: EntityOut[];
-    builders: EntityOut[];
-    rate_pages: EntityOut[];
-    property_pdps: EntityOut[];
-    [k: string]: EntityOut[];
-  };
-  fallbacks?: {
-    relaxed_used?: boolean;
-    trending?: EntityOut[];
-    reason?: string | null;
-  } | null;
-};
+import SearchBar from "@/components/SearchBar";
+import { apiGet } from "@/lib/api";
+import type { SuggestItem, SuggestResponse } from "@/lib/types";
 
 type ParseResponse = {
   q: string;
-  intent: "buy" | "rent" | null;
+  intent: string | null;
   bhk: number | null;
   locality_hint: string | null;
   max_price: number | null;
@@ -55,60 +14,106 @@ type ParseResponse = {
   ok: boolean;
 };
 
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
+type SearchParams = { q?: string; city_id?: string };
+type Props = { searchParams: SearchParams | Promise<SearchParams> };
 
-function countGroups(groups: SearchResponse["groups"]): number {
-  return Object.values(groups).reduce((acc, arr) => acc + (Array.isArray(arr) ? arr.length : 0), 0);
+function labelFor(e: SuggestItem): string {
+  switch (e.entity_type) {
+    case "builder":
+      return "BLD";
+    case "city":
+      return "CITY";
+    case "project":
+      return "PRJ";
+    case "micromarket":
+      return "MM";
+    case "locality":
+      return "LOC";
+    case "rate_page":
+      return "RATE";
+    case "property_pdp":
+      return "PROP";
+    default:
+      return "RES";
+  }
 }
 
-function fmtINR(n: number): string {
-  // simple formatter (keeps local dev predictable)
-  return `₹${n.toLocaleString("en-IN")}`;
+function metaFor(e: SuggestItem): string {
+  const bits: string[] = [];
+  if (e.entity_type) bits.push(e.entity_type);
+  if (e.city) bits.push(e.city);
+  if (e.parent_name) bits.push(e.parent_name);
+  return bits.join(" • ");
 }
 
-export default async function SearchPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ q?: string; city_id?: string }>;
-}) {
-  const sp = await searchParams;
-  const rawQ = (sp.q || "").trim();
-  const cityId = (sp.city_id || "").trim();
+function goHref(canonicalUrl: string, q: string) {
+  const sp = new URLSearchParams();
+  sp.set("url", canonicalUrl);
+  if (q) sp.set("q", q);
+  return `/go?${sp.toString()}`;
+}
 
-  if (!rawQ) {
-    return (
-      <main className="p-6">
-        <h1 className="text-xl font-semibold">Search</h1>
-        <p className="mt-2 opacity-70">Type a query in the search bar.</p>
+function ResultCard({ e, q }: { e: SuggestItem; q: string }) {
+  return (
+    <Link className="resultCard" href={goHref(e.canonical_url, q)}>
+      <div className="tag">{labelFor(e)}</div>
+      <div>
+        <div className="resultTitle">{e.name}</div>
+        <div className="resultMeta">{metaFor(e)}</div>
+        <div className="resultMeta">URL: {e.canonical_url}</div>
+      </div>
+    </Link>
+  );
+}
+
+export default async function SearchPage(props: Props) {
+  const sp = await props.searchParams;
+
+  const rawQ = (sp?.q ?? "").toString().trim();
+  const city_id = (sp?.city_id ?? "").toString().trim();
+
+  return (
+    <div className="appShell">
+      <main className="page">
+        <div className="hero">
+          <h1 className="title">Search results</h1>
+          <div className="sub">Type a query to see results.</div>
+        </div>
+
+        <SearchBar initialQ={rawQ} initialCityId={city_id} />
+
+        {!rawQ ? null : (
+          <div className="card" style={{ marginTop: 14 }}>
+            <div className="kv">
+              <div>Query</div>
+              <div style={{ opacity: 0.9 }}>{rawQ}</div>
+            </div>
+
+            {(() => {
+              // 1) Parse query
+              // (server-side so /search can also behave like a SERP for constraint queries)
+              return null;
+            })()}
+          </div>
+        )}
+
+        {rawQ ? (
+          <ResultsBlock q={rawQ} cityId={city_id} />
+        ) : null}
       </main>
-    );
-  }
+    </div>
+  );
+}
 
-  // Parse constraints (best-effort)
-  let parsed: ParseResponse | null = null;
-  try {
-    const pr = await fetch(`${API_BASE}/api/v1/search/parse?q=${encodeURIComponent(rawQ)}`, {
-      cache: "no-store",
-    });
-    if (pr.ok) parsed = (await pr.json()) as ParseResponse;
-  } catch {
-    parsed = null;
-  }
+async function ResultsBlock({ q, cityId }: { q: string; cityId: string }) {
+  const parse = await apiGet<ParseResponse>("/api/v1/search/parse", { q });
+  const effectiveQ = (parse?.locality_hint || q).trim();
 
-  // If constraint-heavy and we extracted a locality, search using that hint for better entity matches
-  const effectiveQ = parsed?.locality_hint ? parsed.locality_hint : rawQ;
-
-  let data: SearchResponse | null = null;
-  try {
-    const url =
-      `${API_BASE}/api/v1/search?q=${encodeURIComponent(effectiveQ)}&limit=20` +
-      (cityId ? `&city_id=${encodeURIComponent(cityId)}` : "");
-    const r = await fetch(url, { cache: "no-store" });
-    if (r.ok) data = (await r.json()) as SearchResponse;
-  } catch {
-    data = null;
-  }
+  const data = await apiGet<SuggestResponse>("/api/v1/search", {
+    q: effectiveQ,
+    city_id: cityId || undefined,
+    limit: 10,
+  });
 
   const groups = data?.groups || {
     locations: [],
@@ -118,127 +123,122 @@ export default async function SearchPage({
     property_pdps: [],
   };
 
-  const total = countGroups(groups);
-  const didYouMean = data?.did_you_mean && data.did_you_mean.toLowerCase() !== rawQ.toLowerCase() ? data.did_you_mean : null;
+  const total =
+    (groups.locations?.length || 0) +
+    (groups.projects?.length || 0) +
+    (groups.builders?.length || 0) +
+    (groups.rate_pages?.length || 0) +
+    (groups.property_pdps?.length || 0);
+
+  const trending = data?.fallbacks?.trending || [];
+  const showTrending = total === 0 && trending.length > 0;
 
   return (
-    <main className="p-6">
-      <h1 className="text-xl font-semibold">Search results</h1>
-
-      <div className="mt-2 text-sm opacity-80">
-        Query: <span className="font-medium">{rawQ}</span>
+    <>
+      <div className="card" style={{ marginTop: 14 }}>
+        <div className="kv">
+          <div>Effective query</div>
+          <div style={{ opacity: 0.9 }}>{effectiveQ}</div>
+        </div>
+        <div className="kv">
+          <div>Results</div>
+          <div style={{ opacity: 0.9 }}>{total}</div>
+        </div>
+        {data?.did_you_mean ? (
+          <div className="hint" style={{ marginTop: 10 }}>
+            Did you mean{" "}
+            <Link className="link" href={`/search?q=${encodeURIComponent(data.did_you_mean)}`}>
+              {data.did_you_mean}
+            </Link>
+            ?
+          </div>
+        ) : null}
       </div>
 
-      {parsed?.ok ? (
-        <div className="mt-3 flex flex-wrap gap-2 text-xs">
-          {parsed.intent ? <span className="rounded border px-2 py-1">Intent: {parsed.intent}</span> : null}
-          {parsed.bhk ? <span className="rounded border px-2 py-1">{parsed.bhk} BHK</span> : null}
-          {parsed.locality_hint ? <span className="rounded border px-2 py-1">Locality: {parsed.locality_hint}</span> : null}
-          {parsed.max_price ? <span className="rounded border px-2 py-1">Max Price: {fmtINR(parsed.max_price)}</span> : null}
-          {parsed.max_rent ? <span className="rounded border px-2 py-1">Max Rent: {fmtINR(parsed.max_rent)}/mo</span> : null}
+      {total === 0 ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">No results found</div>
+          <div className="sub" style={{ marginTop: 6 }}>
+            Try a different spelling or choose from trending.
+          </div>
+
+          {showTrending ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="sectionTitle" style={{ fontSize: 13, opacity: 0.75 }}>
+                Trending
+              </div>
+
+              <div className="pillRow" style={{ marginTop: 10 }}>
+                {trending.map((e) => (
+                  <Link
+                    key={e.id}
+                    className="pill"
+                    href={goHref(e.canonical_url, "")}
+                    title={metaFor(e)}
+                  >
+                    {e.name}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
-      {didYouMean ? (
-        <div className="mt-4 rounded border p-3 text-sm">
-          Did you mean{" "}
-          <Link className="underline" href={`/search?q=${encodeURIComponent(didYouMean)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`}>
-            {didYouMean}
-          </Link>
-          ?
+      {groups.locations?.length ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">Locations</div>
+          <div style={{ marginTop: 10 }}>
+            {groups.locations.map((e) => (
+              <ResultCard key={e.id} e={e} q={q} />
+            ))}
+          </div>
         </div>
       ) : null}
 
-      <div className="mt-4 text-sm opacity-70">
-        {total > 0 ? `${total} results` : "No direct matches"}
-      </div>
+      {groups.projects?.length ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">Projects</div>
+          <div style={{ marginTop: 10 }}>
+            {groups.projects.map((e) => (
+              <ResultCard key={e.id} e={e} q={q} />
+            ))}
+          </div>
+        </div>
+      ) : null}
 
-      {/* Sections */}
-      <div className="mt-6 space-y-6">
-        {groups.locations.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Locations</h2>
-            <div className="rounded border divide-y">
-              {groups.locations.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                  <div className="text-xs opacity-70">{[e.parent_name, e.city].filter(Boolean).join(" • ")}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
+      {groups.builders?.length ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">Builders</div>
+          <div style={{ marginTop: 10 }}>
+            {groups.builders.map((e) => (
+              <ResultCard key={e.id} e={e} q={q} />
+            ))}
+          </div>
+        </div>
+      ) : null}
 
-        {groups.projects.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Projects</h2>
-            <div className="rounded border divide-y">
-              {groups.projects.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                  <div className="text-xs opacity-70">{[e.parent_name, e.city].filter(Boolean).join(" • ")}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
+      {groups.rate_pages?.length ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">Property Rates</div>
+          <div style={{ marginTop: 10 }}>
+            {groups.rate_pages.map((e) => (
+              <ResultCard key={e.id} e={e} q={q} />
+            ))}
+          </div>
+        </div>
+      ) : null}
 
-        {groups.builders.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Builders</h2>
-            <div className="rounded border divide-y">
-              {groups.builders.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        {groups.rate_pages.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Property Rates</h2>
-            <div className="rounded border divide-y">
-              {groups.rate_pages.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                  <div className="text-xs opacity-70">{[e.parent_name, e.city].filter(Boolean).join(" • ")}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        {groups.property_pdps.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Properties</h2>
-            <div className="rounded border divide-y">
-              {groups.property_pdps.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                  <div className="text-xs opacity-70">{[e.parent_name, e.city].filter(Boolean).join(" • ")}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        {/* Fallback trending on SERP (when no results) */}
-        {total === 0 && data?.fallbacks?.trending?.length ? (
-          <section>
-            <h2 className="text-sm font-semibold opacity-70 mb-2">Trending</h2>
-            <div className="rounded border divide-y">
-              {data.fallbacks.trending.map((e) => (
-                <Link key={e.id} href={e.canonical_url} className="block px-4 py-3 hover:bg-black/5">
-                  <div className="font-medium text-sm">{e.name}</div>
-                  <div className="text-xs opacity-70">{[e.parent_name, e.city].filter(Boolean).join(" • ")}</div>
-                </Link>
-              ))}
-            </div>
-          </section>
-        ) : null}
-      </div>
-    </main>
+      {groups.property_pdps?.length ? (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="sectionTitle">Properties</div>
+          <div style={{ marginTop: 10 }}>
+            {groups.property_pdps.map((e) => (
+              <ResultCard key={e.id} e={e} q={q} />
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
