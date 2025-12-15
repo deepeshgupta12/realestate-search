@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 
 from fastapi import FastAPI, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import NotFoundError  # noqa: F401
 
