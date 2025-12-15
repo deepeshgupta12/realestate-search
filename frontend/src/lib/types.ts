@@ -1,55 +1,53 @@
-export type EntityType =
-  | "city"
-  | "micromarket"
-  | "locality"
-  | "project"
-  | "builder"
-  | "rate_page"
-  | "property_pdp";
-
-export type SuggestItem = {
+export type EntityOut = {
   id: string;
-  entity_type: EntityType;
+  entity_type: string;
   name: string;
   city?: string;
   city_id?: string;
   parent_name?: string;
   canonical_url: string;
-  score?: number;
-  popularity_score?: number;
-};
-
-export type SuggestGroups = {
-  locations: SuggestItem[];
-  projects: SuggestItem[];
-  builders: SuggestItem[];
-  rate_pages: SuggestItem[];
-  property_pdps: SuggestItem[];
-};
-
-export type SuggestFallbacks = {
-  relaxed_used: boolean;
-  trending: SuggestItem[];
-  reason: string | null;
+  score?: number | null;
+  popularity_score?: number | null;
 };
 
 export type SuggestResponse = {
   q: string;
   normalized_q: string;
-  did_you_mean: string | null;
-  groups: SuggestGroups;
-  fallbacks: SuggestFallbacks;
-};
-
-export type TrendingResponse = {
-  city_id: string | null;
-  items: SuggestItem[];
+  did_you_mean?: string | null;
+  groups: {
+    locations: EntityOut[];
+    projects: EntityOut[];
+    builders: EntityOut[];
+    rate_pages: EntityOut[];
+    property_pdps: EntityOut[];
+  };
+  fallbacks?: {
+    relaxed_used?: boolean;
+    trending?: EntityOut[];
+    reason?: string | null;
+  } | null;
 };
 
 export type ResolveResponse = {
-  action: "redirect" | "serp";
+  action: "redirect" | "serp" | "disambiguate";
   query: string;
   normalized_query: string;
-  url: string | null;
+  url?: string | null;
+  match?: EntityOut | null;
   reason?: string | null;
+  debug?: Record<string, any> | null;
+  candidates?: EntityOut[] | null;
+};
+
+export type TrendingResponse = {
+  city_id?: string | null;
+  items: EntityOut[];
+};
+
+export type ZeroStateResponse = {
+  city_id: string | null;
+  recent_searches: string[];
+  trending_searches: EntityOut[];
+  trending_localities: EntityOut[];
+  popular_entities: EntityOut[];
 };
