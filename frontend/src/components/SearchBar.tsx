@@ -179,6 +179,16 @@ export default function SearchBar({ contextUrl = "/" }: Props) {
 
       await logSearch(qid, raw, res.normalized_query);
 
+      if (res.action === "disambiguate") {
+        const params = new URLSearchParams();
+        params.set("q", q);
+        params.set("qid", qid);
+        if (cityId) params.set("city_id", city_id);
+        if (contextUrl) params.set("context_url", contextUrl);
+        router.push(`/disambiguate?${params.toString()}`);
+        return;
+}
+
       if (res.action === "redirect") {
         if (res.match) {
           navigateViaGo(res.match, qid, 1);

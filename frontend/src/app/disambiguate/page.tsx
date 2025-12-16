@@ -1,149 +1,110 @@
-import Link from "next/link";
-import { redirect } from "next/navigation";
+"use client";
 
-type EntityOut = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
-  canonical_url: string;
-  score?: number | null;
-  popularity_score?: number | null;
-};
+import React, { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { apiGet } from "@/lib/api";
+import type { ResolveResponse, EntityOut } from "@/lib/types";
 
-type ResolveResponse = {
-  action: "redirect" | "serp" | "disambiguate";
-  query: string;
-  normalized_query: string;
-  url?: string | null;
-  match?: EntityOut | null;
-  candidates?: EntityOut[] | null;
-  reason?: string | null;
-  debug?: Record<string, any> | null;
-};
+export default function DisambiguatePage() {
+  const router = useRouter();
+  const sp = useSearchParams();
 
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
+  const q = (sp.get("q") || "").trim();
+  const qidParam = (sp.get("qid") || "").trim();
+  const cityId = (sp.get("city_id") || "").trim() || undefined;
+  const contextUrl = (sp.get("context_url") || "/").trim() || "/";
 
-function goUrl(params: {
-  url: string;
-  qid?: string | null;
-  entity_id?: string | null;
-  entity_type?: string | null;
-  rank?: number | null;
-  city_id?: string | null;
-  context_url?: string | null;
-}) {
-  const sp = new URLSearchParams();
-  sp.set("url", params.url);
-  if (params.qid) sp.set("qid", params.qid);
-  if (params.entity_id) sp.set("entity_id", params.entity_id);
-  if (params.entity_type) sp.set("entity_type", params.entity_type);
-  if (typeof params.rank === "number") sp.set("rank", String(params.rank));
-  if (params.city_id) sp.set("city_id", params.city_id);
-  if (params.context_url) sp.set("context_url", params.context_url);
-  return `/go?${sp.toString()}`;
-}
+  const qid = useMemo(() => qidParam || (globalThis.crypto?.randomUUID?.() ?? `qid_${Date.now()}`), [qidParam]);
 
-export default async function DisambiguatePage({
-  searchParams,
-}: {
-  searchParams: Promise<{ q?: string; qid?: string; city_id?: string; context_url?: string }>;
-}) {
-  const sp = await searchParams;
-  const q = (sp.q || "").trim();
-  const qid = (sp.qid || "").trim();
-  const cityId = (sp.city_id || "").trim();
-  const contextUrl = (sp.context_url || "").trim();
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [resp, setResp] = useState<ResolveResponse | null>(null);
 
-  if (!q) {
-    redirect("/");
-  }
+  useEffect(() => {
+    let mounted = true;
+    async function run() {
+      if (!q) return;
+      setLoading(true);
+      setErr(null);
+      try {
+        const r = await apiGet<ResolveResponse>("/search/resolve", {
+          q,
+          city_id: cityId,
+          context_url: contextUrl,
+        });
+        if (!mounted) return;
+        setResp(r);
 
-  const url =
-    `${API_BASE}/api/v1/search/resolve?q=${encodeURIComponent(q)}` +
-    (cityId ? `&city_id=${encodeURIComponent(cityId)}` : "") +
-    (contextUrl ? `&context_url=${encodeURIComponent(contextUrl)}` : "");
+        // If backend doesn't return disambiguate, route accordingly
+        if (r.action === "redirect" && r.url) {
+          router.replace(`/go?url=${encodeURIComponent(r.url)}&qid=${encodeURIComponent(qid)}&context_url=${encodeURIComponent(contextUrl)}`);
+          return;
+        }
+        if (r.action === "serp") {
+          const url = r.url || `/search?q=${encodeURIComponent(q)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`;
+          router.replace(`${url}${url.includes("?") ? "&" : "?"}qid=${encodeURIComponent(qid)}&context_url=${encodeURIComponent(contextUrl)}`);
+          return;
+        }
+      } catch (e: any) {
+        if (!mounted) return;
+        setErr(e?.message || "Failed to resolve");
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    }
+    run();
+    return () => {
+      mounted = false;
+    };
+  }, [q, cityId, contextUrl, qid, router]);
 
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
-    return (
-      <main className="p-6">
-        <h1 className="text-xl font-semibold">Choose one</h1>
-        <p className="mt-2 opacity-70">Resolve API failed ({r.status}).</p>
-      </main>
+  const candidates: EntityOut[] = (resp?.action === "disambiguate" && resp.candidates) ? resp.candidates : [];
+
+  function pick(c: EntityOut, rank: number) {
+    const target = c.canonical_url;
+    router.push(
+      `/go?url=${encodeURIComponent(target)}&qid=${encodeURIComponent(qid)}&eid=${encodeURIComponent(c.id)}&etype=${encodeURIComponent(c.entity_type)}&rank=${encodeURIComponent(
+        String(rank)
+      )}&city_id=${encodeURIComponent(c.city_id || "")}&context_url=${encodeURIComponent(contextUrl)}`
     );
   }
-
-  const data = (await r.json()) as ResolveResponse;
-
-  // If user landed here but backend no longer wants disambiguation, route correctly
-  if (data.action === "redirect" && data.url) {
-    const m = data.match || null;
-    redirect(
-      goUrl({
-        url: data.url,
-        qid: qid || null,
-        entity_id: m?.id || null,
-        entity_type: m?.entity_type || null,
-        rank: 1,
-        city_id: cityId || null,
-        context_url: contextUrl || null,
-      })
-    );
-  }
-
-  if (data.action === "serp" && data.url) {
-    redirect(data.url);
-  }
-
-  const candidates = data.candidates || [];
 
   return (
-    <main className="p-6">
-      <h1 className="text-xl font-semibold">Choose one</h1>
-      <div className="mt-2 text-sm opacity-80">
-        Query: <span className="font-medium">{q}</span>
-      </div>
+    <main className="min-h-screen px-6 py-10">
+      <div className="mx-auto max-w-3xl">
+        <h1 className="text-2xl font-semibold">Which one did you mean?</h1>
+        <div className="mt-2 text-sm opacity-70">
+          Query: <span className="font-mono">{q || "(empty)"}</span>
+        </div>
 
-      {candidates.length === 0 ? (
-        <div className="mt-6 rounded border p-4">
-          <div className="font-medium">No candidates returned.</div>
-          <div className="mt-1 text-sm opacity-70">
-            Try{" "}
-            <Link className="underline" href={`/search?q=${encodeURIComponent(q)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`}>
-              Search results
-            </Link>
-            .
+        {loading && <div className="mt-6 text-sm opacity-70">Loading…</div>}
+        {err && <div className="mt-6 text-sm text-red-400">{err}</div>}
+
+        {!loading && !err && resp?.action === "disambiguate" && (
+          <div className="mt-6 space-y-3">
+            {candidates.length === 0 ? (
+              <div className="text-sm opacity-70">No candidates returned.</div>
+            ) : (
+              candidates.map((c, idx) => (
+                <button
+                  key={`${c.id}-${idx}`}
+                  type="button"
+                  onClick={() => pick(c, idx + 1)}
+                  className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left hover:bg-white/10"
+                >
+                  <div className="text-base font-medium">{c.name}</div>
+                  <div className="mt-1 text-xs opacity-70">
+                    <span className="font-mono">{c.entity_type}</span>
+                    {c.city ? <span> · {c.city}</span> : null}
+                    {c.parent_name ? <span> · {c.parent_name}</span> : null}
+                  </div>
+                  <div className="mt-2 text-xs opacity-60 font-mono">{c.canonical_url}</div>
+                </button>
+              ))
+            )}
           </div>
-        </div>
-      ) : (
-        <div className="mt-6 rounded border divide-y">
-          {candidates.map((c, idx) => {
-            const subtitle = [c.parent_name, c.city].filter(Boolean).join(" • ");
-            return (
-              <Link
-                key={c.id}
-                className="block px-4 py-3 hover:bg-black/5"
-                href={goUrl({
-                  url: c.canonical_url,
-                  qid: qid || null,
-                  entity_id: c.id,
-                  entity_type: c.entity_type,
-                  rank: idx + 1,
-                  city_id: cityId || null,
-                  context_url: contextUrl || null,
-                })}
-              >
-                <div className="font-medium text-sm">{c.name}</div>
-                <div className="text-xs opacity-70">{subtitle}</div>
-              </Link>
-            );
-          })}
-        </div>
-      )}
+        )}
+      </div>
     </main>
   );
 }
