@@ -1,24 +1,48 @@
-type Params = Record<string, string | number | boolean | null | undefined>;
+/**
+ * Frontend API helper
+ * - Always targets NEXT_PUBLIC_API_BASE (defaults to localhost:8000)
+ * - Auto-prefixes relative paths with /api/v1
+ * - Exposes buildUrl for places that need direct URLs
+ */
 
-const DEFAULT_BACKEND = "http://localhost:8000";
-const DEFAULT_PREFIX = "/api/v1";
+export const API_PREFIX = "/api/v1";
 
-export function buildUrl(path: string, params?: Params): string {
-  const base = process.env.NEXT_PUBLIC_BACKEND_URL || DEFAULT_BACKEND;
-  const prefix = process.env.NEXT_PUBLIC_API_PREFIX || DEFAULT_PREFIX;
+function apiBase(): string {
+  return (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/+$/, "");
+}
 
-  let p = path.startsWith("/") ? path : `/${path}`;
+function ensureLeadingSlash(p: string): string {
+  if (!p) return "/";
+  return p.startsWith("/") ? p : `/${p}`;
+}
 
-  // If caller passes "/search/xyz", auto-prefix to "/api/v1/search/xyz"
-  if (!p.startsWith(prefix) && !p.startsWith("/health") && !p.startsWith("/openapi")) {
-    p = `${prefix}${p}`;
-  }
+function normalizePath(path: string): string {
+  // absolute URL -> leave as-is
+  if (/^https?:\/\//i.test(path)) return path;
 
-  const u = new URL(p, base);
+  const p = ensureLeadingSlash(path);
+
+  // already versioned or special endpoints
+  if (p.startsWith(API_PREFIX + "/")) return p;
+  if (p === API_PREFIX) return p;
+  if (p === "/health" || p.startsWith("/health?")) return p;
+
+  // otherwise prefix
+  return `${API_PREFIX}${p}`;
+}
+
+export function buildUrl(
+  path: string,
+  params?: Record<string, string | number | boolean | null | undefined>
+): string {
+  const normalized = normalizePath(path);
+
+  // If normalized is still absolute, URL() will handle it fine.
+  const u = new URL(normalized, apiBase());
 
   if (params) {
     for (const [k, v] of Object.entries(params)) {
-      if (v === null || v === undefined) continue;
+      if (v === undefined || v === null) continue;
       u.searchParams.set(k, String(v));
     }
   }
@@ -26,46 +50,53 @@ export function buildUrl(path: string, params?: Params): string {
   return u.toString();
 }
 
-async function readErr(res: Response): Promise<string> {
+async function readJsonOrText(res: Response) {
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return res.json();
+  const t = await res.text();
   try {
-    const t = await res.text();
-    return t || `${res.status} ${res.statusText}`;
+    return JSON.parse(t);
   } catch {
-    return `${res.status} ${res.statusText}`;
+    return t;
   }
 }
 
-export async function apiGet<T>(path: string, params?: Params, init?: RequestInit): Promise<T> {
+export async function apiGet<T>(
+  path: string,
+  params?: Record<string, string | number | boolean | null | undefined>
+): Promise<T> {
   const url = buildUrl(path, params);
   const res = await fetch(url, {
     method: "GET",
+    headers: { Accept: "application/json" },
     cache: "no-store",
-    ...init,
-    headers: {
-      ...(init?.headers || {}),
-    },
   });
-  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status} ${await readErr(res)}`);
+
+  if (!res.ok) {
+    const body = await readJsonOrText(res);
+    throw new Error(`GET ${new URL(url).pathname}${new URL(url).search} failed: ${res.status} ${JSON.stringify(body)}`);
+  }
+
   return (await res.json()) as T;
 }
 
 export async function apiPost<T>(
   path: string,
   body: unknown,
-  params?: Params,
-  init?: RequestInit
+  params?: Record<string, string | number | boolean | null | undefined>
 ): Promise<T> {
   const url = buildUrl(path, params);
   const res = await fetch(url, {
     method: "POST",
-    cache: "no-store",
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
+    cache: "no-store",
   });
-  if (!res.ok) throw new Error(`POST ${path} failed: ${res.status} ${await readErr(res)}`);
+
+  if (!res.ok) {
+    const b = await readJsonOrText(res);
+    throw new Error(`POST ${new URL(url).pathname}${new URL(url).search} failed: ${res.status} ${JSON.stringify(b)}`);
+  }
+
   return (await res.json()) as T;
 }
