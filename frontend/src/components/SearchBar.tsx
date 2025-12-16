@@ -2,343 +2,451 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiGet } from "@/lib/api";
+import { apiGet, apiPost } from "@/lib/api";
+import type { EntityOut, SuggestResponse, ZeroStateResponse, ResolveResponse, EventOk } from "@/lib/types";
 
-// Keep this local + defensive so TS types never block compilation.
-type EntityOut = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string | null;
-  city_id?: string | null;
-  parent_name?: string | null;
-  canonical_url: string;
-  popularity_score?: number | null;
-  score?: number | null;
+type Props = {
+  contextUrl?: string;
 };
 
-type SuggestResponse = {
-  q: string;
-  normalized_q: string;
-  did_you_mean?: string | null;
-  groups: {
-    locations: EntityOut[];
-    projects: EntityOut[];
-    builders: EntityOut[];
-    rate_pages: EntityOut[];
-    property_pdps: EntityOut[];
-  };
-  fallbacks?: {
-    relaxed_used?: boolean;
-    trending?: EntityOut[];
-    reason?: string | null;
-  };
-};
-
-type ZeroStateResponse = {
-  city_id: string | null;
-  recent_searches: string[];
-  trending_searches: EntityOut[];
-  trending_localities: EntityOut[];
-  popular_entities: EntityOut[];
-};
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000/api/v1";
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function normQuery(q: string) {
-  return q.trim().toLowerCase();
-}
-
-async function bestEffortPost(path: string, body: any) {
+function mkQid(): string {
+  // Works in modern browsers; fallback for older environments
   try {
-    await fetch(`${API_BASE}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // @ts-expect-error crypto may not be typed in some setups
+    return crypto.randomUUID();
   } catch {
-    // swallow on purpose (best-effort)
+    return `qid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   }
 }
 
-export default function SearchBar() {
+function enc(v: string): string {
+  return encodeURIComponent(v);
+}
+
+function goHref(args: {
+  url: string;
+  qid: string;
+  entityId?: string;
+  entityType?: string;
+  rank?: number;
+  cityId?: string | null;
+  contextUrl?: string | null;
+}): string {
+  const qp: string[] = [];
+  qp.push(`url=${enc(args.url)}`);
+  qp.push(`qid=${enc(args.qid)}`);
+  if (args.entityId) qp.push(`entity_id=${enc(args.entityId)}`);
+  if (args.entityType) qp.push(`entity_type=${enc(args.entityType)}`);
+  if (typeof args.rank === "number") qp.push(`rank=${args.rank}`);
+  if (args.cityId) qp.push(`city_id=${enc(args.cityId)}`);
+  if (args.contextUrl) qp.push(`context_url=${enc(args.contextUrl)}`);
+  return `/go?${qp.join("&")}`;
+}
+
+export default function SearchBar({ contextUrl = "/" }: Props) {
   const router = useRouter();
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   const [q, setQ] = useState("");
-  const [cityId, setCityId] = useState<string>(""); // "" = all
-  const [open, setOpen] = useState(false);
+  const [cityId, setCityId] = useState<string>("");
 
   const [zero, setZero] = useState<ZeroStateResponse | null>(null);
   const [suggest, setSuggest] = useState<SuggestResponse | null>(null);
+
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Latest “query id” to associate clicks with this typing session.
-  const sessionQidRef = useRef<string | null>(null);
+  const [showDropdown, setShowDropdown] = useState(false);
 
-  const qTrim = q.trim();
+  const [disambOpen, setDisambOpen] = useState(false);
+  const [disambQid, setDisambQid] = useState<string | null>(null);
+  const [disambQuery, setDisambQuery] = useState<string>("");
+  const [disambCandidates, setDisambCandidates] = useState<EntityOut[]>([]);
 
-  // Fetch zero-state when input becomes empty / dropdown opens
+  const normalizedCityId = cityId.trim() ? cityId.trim() : null;
+
   useEffect(() => {
-    if (!open) return;
+    let cancelled = false;
 
-    if (qTrim.length > 0) return;
-
-    const controller = new AbortController();
     (async () => {
-      setErr(null);
       try {
-        const qs = new URLSearchParams();
-        if (cityId) qs.set("city_id", cityId);
-        qs.set("limit", "8");
-        const res = await apiGet<ZeroStateResponse>(`/search/zero-state?${qs.toString()}`);
-        setZero(res);
+        setErr(null);
+        const data = await apiGet<ZeroStateResponse>("/search/zero-state", {
+          city_id: normalizedCityId,
+          context_url: contextUrl,
+          limit: 8,
+        });
+        if (!cancelled) setZero(data);
       } catch (e: any) {
-        setErr(`GET /search/zero-state failed: ${e?.message ?? String(e)}`);
+        if (!cancelled) setErr(String(e?.message || e));
       }
     })();
 
-    return () => controller.abort();
-  }, [open, qTrim, cityId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [normalizedCityId, contextUrl]);
 
-  // Suggest as you type
   useEffect(() => {
-    if (!open) return;
-
-    if (qTrim.length === 0) {
+    const qq = q.trim();
+    if (!qq) {
       setSuggest(null);
       return;
     }
 
-    const controller = new AbortController();
+    let cancelled = false;
     const t = setTimeout(async () => {
-      setLoading(true);
-      setErr(null);
       try {
-        const qs = new URLSearchParams();
-        qs.set("q", qTrim);
-        if (cityId) qs.set("city_id", cityId);
-        qs.set("limit", "10");
-        const res = await apiGet<SuggestResponse>(`/search/suggest?${qs.toString()}`);
-        setSuggest(res);
+        setErr(null);
+        const data = await apiGet<SuggestResponse>("/search/suggest", {
+          q: qq,
+          city_id: normalizedCityId,
+          context_url: contextUrl,
+          limit: 10,
+        });
+        if (!cancelled) {
+          setSuggest(data);
+          setShowDropdown(true);
+        }
       } catch (e: any) {
-        setErr(`GET /search/suggest failed: ${e?.message ?? String(e)}`);
-        setSuggest(null);
-      } finally {
-        setLoading(false);
+        if (!cancelled) setErr(String(e?.message || e));
       }
     }, 120);
 
     return () => {
+      cancelled = true;
       clearTimeout(t);
-      controller.abort();
     };
-  }, [open, qTrim, cityId]);
+  }, [q, normalizedCityId, contextUrl]);
 
-  function ensureSessionQid() {
-    if (!sessionQidRef.current) {
-      sessionQidRef.current = crypto.randomUUID();
+  const groups = suggest?.groups;
+  const hasAnySuggestions = useMemo(() => {
+    if (!groups) return false;
+    return (
+      groups.locations.length +
+        groups.projects.length +
+        groups.builders.length +
+        groups.rate_pages.length +
+        groups.property_pdps.length >
+      0
+    );
+  }, [groups]);
+
+  async function logSearch(qid: string, raw: string, normalized: string) {
+    try {
+      await apiPost<EventOk>("/events/search", {
+        query_id: qid,
+        raw_query: raw,
+        normalized_query: normalized,
+        city_id: normalizedCityId,
+        context_url: contextUrl,
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      // non-blocking
     }
-    return sessionQidRef.current;
   }
 
-  async function onPickEntity(entity: EntityOut, rank: number) {
-    const qid = ensureSessionQid();
-    const raw = qTrim || entity.name;
-
-    // Best-effort: log "search" event for this session (so click has a parent query_id).
-    await bestEffortPost("/events/search", {
-      query_id: qid,
-      raw_query: raw,
-      normalized_query: normQuery(raw),
-      city_id: cityId || null,
-      context_url: "/",
-      timestamp: nowIso(),
+  function navigateViaGo(item: EntityOut, qid: string, rank: number) {
+    const href = goHref({
+      url: item.canonical_url,
+      qid,
+      entityId: item.id,
+      entityType: item.entity_type,
+      rank,
+      cityId: normalizedCityId,
+      contextUrl,
     });
-
-    const qs = new URLSearchParams();
-    qs.set("url", entity.canonical_url);
-    qs.set("qid", qid);
-    qs.set("entity_id", entity.id);
-    qs.set("entity_type", entity.entity_type);
-    qs.set("rank", String(rank));
-    if (cityId) qs.set("city_id", cityId);
-    qs.set("context_url", "/");
-
-    setOpen(false);
-    router.push(`/go?${qs.toString()}`);
+    router.push(href);
   }
 
-  function onSeeAllResults() {
-    const qid = ensureSessionQid();
-    const qs = new URLSearchParams();
-    qs.set("q", qTrim);
-    if (cityId) qs.set("city_id", cityId);
-    qs.set("qid", qid);
-    setOpen(false);
-    router.push(`/search?${qs.toString()}`);
+  async function onSubmit(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    const raw = q.trim();
+    if (!raw) return;
+
+    setLoading(true);
+    setErr(null);
+
+    const qid = mkQid();
+
+    try {
+      const res = await apiGet<ResolveResponse>("/search/resolve", {
+        q: raw,
+        city_id: normalizedCityId,
+        context_url: contextUrl,
+      });
+
+      await logSearch(qid, raw, res.normalized_query);
+
+      if (res.action === "redirect") {
+        if (res.match) {
+          navigateViaGo(res.match, qid, 1);
+        } else {
+          router.push(goHref({ url: res.url, qid, cityId: normalizedCityId, contextUrl }));
+        }
+        return;
+      }
+
+      if (res.action === "serp") {
+        router.push(res.url);
+        return;
+      }
+
+      // disambiguate
+      setDisambQid(qid);
+      setDisambQuery(raw);
+      setDisambCandidates(res.candidates || []);
+      setDisambOpen(true);
+      setShowDropdown(false);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
   }
 
-  // Render helpers
-  const groups = useMemo(() => {
-    const g = suggest?.groups;
-    return {
-      locations: g?.locations ?? [],
-      rate_pages: g?.rate_pages ?? [],
-      property_pdps: g?.property_pdps ?? [],
-      projects: g?.projects ?? [],
-      builders: g?.builders ?? [],
-    };
-  }, [suggest]);
+  function renderEntityRow(item: EntityOut, idx: number) {
+    return (
+      <button
+        key={`${item.id}_${idx}`}
+        type="button"
+        className="w-full text-left px-3 py-2 hover:bg-white/5 rounded-md"
+        onClick={() => {
+          const qid = disambQid || mkQid();
+          // treat a disambiguation selection as a click on the chosen entity
+          navigateViaGo(item, qid, idx + 1);
+          setDisambOpen(false);
+        }}
+      >
+        <div className="text-sm font-semibold">{item.name}</div>
+        <div className="text-xs opacity-70">
+          {item.entity_type} · {item.city || "-"}{item.parent_name ? ` · ${item.parent_name}` : ""}
+        </div>
+      </button>
+    );
+  }
 
   return (
-    <div style={{ width: "100%", maxWidth: 920 }}>
-      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+    <div className="w-full">
+      <form onSubmit={onSubmit} className="flex gap-2 items-center">
         <select
-          value={cityId || ""}
+          className="bg-white/5 border border-white/10 rounded-md px-2 py-2 text-sm"
+          value={cityId}
           onChange={(e) => setCityId(e.target.value)}
-          style={{ height: 36 }}
-          onFocus={() => setOpen(true)}
         >
           <option value="">All Cities</option>
           <option value="city_pune">Pune</option>
           <option value="city_noida">Noida</option>
         </select>
 
-        <input
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onFocus={() => setOpen(true)}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") setOpen(false);
-            if (e.key === "Enter") onSeeAllResults();
-          }}
-          placeholder="Search city, locality, project…"
-          style={{ flex: 1, height: 36, padding: "0 10px" }}
-        />
+        <div className="flex-1 relative">
+          <input
+            ref={inputRef}
+            className="w-full bg-white/5 border border-white/10 rounded-md px-3 py-2 text-sm"
+            placeholder="Search city, locality, project, builder…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onFocus={() => setShowDropdown(true)}
+          />
 
-        <button type="button" onClick={onSeeAllResults} style={{ height: 36, padding: "0 14px" }}>
-          Search
+          {showDropdown && (q.trim() ? (suggest !== null) : (zero !== null)) && (
+            <div className="absolute z-50 mt-2 w-full bg-black/80 border border-white/10 rounded-lg p-2 backdrop-blur">
+              {!q.trim() && zero && (
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-xs font-semibold opacity-70 mb-2">Trending</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(zero.trending_searches || []).map((x, idx) => (
+                        <button
+                          key={`${x.id}_${idx}`}
+                          type="button"
+                          className="px-2 py-1 text-xs bg-white/5 border border-white/10 rounded-md hover:bg-white/10"
+                          onClick={() => {
+                            setQ(x.name);
+                            setShowDropdown(false);
+                            inputRef.current?.focus();
+                          }}
+                        >
+                          {x.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs font-semibold opacity-70 mb-2">Popular localities</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(zero.trending_localities || []).map((x, idx) => (
+                        <button
+                          key={`${x.id}_${idx}`}
+                          type="button"
+                          className="px-2 py-1 text-xs bg-white/5 border border-white/10 rounded-md hover:bg-white/10"
+                          onClick={() => {
+                            setQ(x.name);
+                            setShowDropdown(false);
+                            inputRef.current?.focus();
+                          }}
+                        >
+                          {x.name}{x.city ? ` · ${x.city}` : ""}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {q.trim() && suggest && (
+                <div className="space-y-3">
+                  {suggest.did_you_mean && (
+                    <div className="text-xs opacity-80 px-2">
+                      Did you mean{" "}
+                      <button
+                        type="button"
+                        className="underline"
+                        onClick={() => {
+                          setQ(suggest.did_you_mean || "");
+                          inputRef.current?.focus();
+                        }}
+                      >
+                        {suggest.did_you_mean}
+                      </button>
+                      ?
+                    </div>
+                  )}
+
+                  {groups?.locations?.length ? (
+                    <div>
+                      <div className="text-xs font-semibold opacity-70 mb-1 px-2">Locations</div>
+                      <div className="space-y-1">
+                        {groups.locations.map((x, idx) => (
+                          <button
+                            key={`${x.id}_${idx}`}
+                            type="button"
+                            className="w-full text-left px-2 py-2 hover:bg-white/5 rounded-md"
+                            onClick={() => {
+                              const qid = mkQid();
+                              // on direct suggestion click, treat as click-through immediately
+                              navigateViaGo(x, qid, idx + 1);
+                              setShowDropdown(false);
+                            }}
+                          >
+                            <div className="text-sm font-semibold">{x.name}</div>
+                            <div className="text-xs opacity-70">
+                              {x.entity_type} · {x.city || "-"}{x.parent_name ? ` · ${x.parent_name}` : ""}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {groups?.rate_pages?.length ? (
+                    <div>
+                      <div className="text-xs font-semibold opacity-70 mb-1 px-2">Property Rates</div>
+                      <div className="space-y-1">
+                        {groups.rate_pages.map((x, idx) => (
+                          <button
+                            key={`${x.id}_${idx}`}
+                            type="button"
+                            className="w-full text-left px-2 py-2 hover:bg-white/5 rounded-md"
+                            onClick={() => {
+                              const qid = mkQid();
+                              navigateViaGo(x, qid, idx + 1);
+                              setShowDropdown(false);
+                            }}
+                          >
+                            <div className="text-sm font-semibold">{x.name}</div>
+                            <div className="text-xs opacity-70">
+                              {x.entity_type} · {x.city || "-"}{x.parent_name ? ` · ${x.parent_name}` : ""}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {groups?.property_pdps?.length ? (
+                    <div>
+                      <div className="text-xs font-semibold opacity-70 mb-1 px-2">Properties</div>
+                      <div className="space-y-1">
+                        {groups.property_pdps.map((x, idx) => (
+                          <button
+                            key={`${x.id}_${idx}`}
+                            type="button"
+                            className="w-full text-left px-2 py-2 hover:bg-white/5 rounded-md"
+                            onClick={() => {
+                              const qid = mkQid();
+                              navigateViaGo(x, qid, idx + 1);
+                              setShowDropdown(false);
+                            }}
+                          >
+                            <div className="text-sm font-semibold">{x.name}</div>
+                            <div className="text-xs opacity-70">
+                              {x.entity_type} · {x.city || "-"}{x.parent_name ? ` · ${x.parent_name}` : ""}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="pt-2 border-t border-white/10">
+                    <button
+                      type="button"
+                      className="w-full text-left px-2 py-2 text-sm hover:bg-white/5 rounded-md"
+                      onClick={() => {
+                        setShowDropdown(false);
+                        router.push(`/search?q=${enc(q.trim())}${normalizedCityId ? `&city_id=${enc(normalizedCityId)}` : ""}`);
+                      }}
+                    >
+                      See all results for "{q.trim()}"
+                    </button>
+                  </div>
+
+                  {!hasAnySuggestions && (
+                    <div className="text-xs opacity-70 px-2">
+                      No matches. Press Enter to search.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="bg-white/10 border border-white/15 rounded-md px-4 py-2 text-sm hover:bg-white/15 disabled:opacity-60"
+        >
+          {loading ? "Searching…" : "Search"}
         </button>
-      </div>
+      </form>
 
-      {open && (
-        <div style={{ marginTop: 8, border: "1px solid rgba(255,255,255,0.15)", borderRadius: 10, padding: 12 }}>
-          {err && <div style={{ marginBottom: 8 }}>{err}</div>}
-          {loading && <div style={{ marginBottom: 8, opacity: 0.85 }}>Loading…</div>}
+      {err && <div className="mt-2 text-xs opacity-80">Error: {err}</div>}
 
-          {/* ZERO STATE */}
-          {qTrim.length === 0 && zero && (
-            <div>
-              <div style={{ fontWeight: 700, marginBottom: 8 }}>Trending</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {zero.trending_searches.map((e, idx) => (
-                  <button
-                    key={`${e.id}-${idx}`}
-                    type="button"
-                    onMouseDown={(ev) => ev.preventDefault()}
-                    onClick={() => onPickEntity(e, idx + 1)}
-                    style={{ padding: "6px 10px" }}
-                  >
-                    {e.name} <span style={{ opacity: 0.7 }}>· {e.entity_type}</span>
-                  </button>
-                ))}
-              </div>
+      {disambOpen && (
+        <div className="mt-3 border border-white/10 rounded-lg bg-white/5 p-3">
+          <div className="text-sm font-semibold mb-2">
+            Multiple matches for "{disambQuery}". Choose one:
+          </div>
+          <div className="space-y-1">
+            {(disambCandidates || []).map((x, idx) => renderEntityRow(x, idx))}
+          </div>
 
-              <div style={{ fontWeight: 700, marginTop: 12, marginBottom: 8 }}>Popular localities</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {zero.trending_localities.map((e, idx) => (
-                  <button
-                    key={`${e.id}-${idx}`}
-                    type="button"
-                    onMouseDown={(ev) => ev.preventDefault()}
-                    onClick={() => onPickEntity(e, idx + 1)}
-                    style={{ padding: "6px 10px" }}
-                  >
-                    {e.name} <span style={{ opacity: 0.7 }}>· {e.city}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* SUGGEST GROUPS */}
-          {qTrim.length > 0 && (
-            <div>
-              {groups.locations.length > 0 && (
-                <>
-                  <div style={{ fontWeight: 700, marginBottom: 6 }}>Locations</div>
-                  {groups.locations.map((e, idx) => (
-                    <div key={`${e.id}-${idx}`}>
-                      <button
-                        type="button"
-                        onMouseDown={(ev) => ev.preventDefault()}
-                        onClick={() => onPickEntity(e, idx + 1)}
-                        style={{ width: "100%", textAlign: "left", padding: "8px 10px" }}
-                      >
-                        <div style={{ fontWeight: 600 }}>{e.name}</div>
-                        <div style={{ opacity: 0.75, fontSize: 12 }}>
-                          {e.entity_type} · {e.city} · {e.parent_name}
-                        </div>
-                      </button>
-                    </div>
-                  ))}
-                </>
-              )}
-
-              {groups.rate_pages.length > 0 && (
-                <>
-                  <div style={{ fontWeight: 700, marginTop: 10, marginBottom: 6 }}>Property Rates</div>
-                  {groups.rate_pages.map((e, idx) => (
-                    <div key={`${e.id}-${idx}`}>
-                      <button
-                        type="button"
-                        onMouseDown={(ev) => ev.preventDefault()}
-                        onClick={() => onPickEntity(e, idx + 1)}
-                        style={{ width: "100%", textAlign: "left", padding: "8px 10px" }}
-                      >
-                        <div style={{ fontWeight: 600 }}>{e.name}</div>
-                        <div style={{ opacity: 0.75, fontSize: 12 }}>
-                          {e.entity_type} · {e.city} · {e.parent_name}
-                        </div>
-                      </button>
-                    </div>
-                  ))}
-                </>
-              )}
-
-              {groups.property_pdps.length > 0 && (
-                <>
-                  <div style={{ fontWeight: 700, marginTop: 10, marginBottom: 6 }}>Properties</div>
-                  {groups.property_pdps.map((e, idx) => (
-                    <div key={`${e.id}-${idx}`}>
-                      <button
-                        type="button"
-                        onMouseDown={(ev) => ev.preventDefault()}
-                        onClick={() => onPickEntity(e, idx + 1)}
-                        style={{ width: "100%", textAlign: "left", padding: "8px 10px" }}
-                      >
-                        <div style={{ fontWeight: 600 }}>{e.name}</div>
-                        <div style={{ opacity: 0.75, fontSize: 12 }}>
-                          {e.entity_type} · {e.city} · {e.parent_name}
-                        </div>
-                      </button>
-                    </div>
-                  ))}
-                </>
-              )}
-
-              <div style={{ marginTop: 10, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 10 }}>
-                <button type="button" onClick={onSeeAllResults} style={{ padding: "8px 10px", width: "100%", textAlign: "left" }}>
-                  See all results for "{qTrim}"
-                </button>
-              </div>
-            </div>
-          )}
+          <div className="pt-2 mt-2 border-t border-white/10">
+            <button
+              type="button"
+              className="text-sm underline"
+              onClick={() => {
+                setDisambOpen(false);
+                router.push(`/search?q=${enc(disambQuery)}${normalizedCityId ? `&city_id=${enc(normalizedCityId)}` : ""}`);
+              }}
+            >
+              Or see all results
+            </button>
+          </div>
         </div>
       )}
     </div>
