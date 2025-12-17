@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from pathlib import Path
-
 import os
 import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
-from fastapi import FastAPI, APIRouter, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import NotFoundError  # noqa: F401
+from fastapi import APIRouter, Body, FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 # -----------------------
 # Config
@@ -21,14 +20,10 @@ from elasticsearch.exceptions import NotFoundError  # noqa: F401
 INDEX_NAME = os.getenv("ES_INDEX", "re_entities_v1")
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 
-# If your docker-compose enables security, set these env vars:
-#   ES_USERNAME=elastic
-#   ES_PASSWORD=<password>
 ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
 
 REQUEST_TIMEOUT = float(os.getenv("ES_REQUEST_TIMEOUT", "3.0"))
-MIN_RESULT_SCORE = float(os.getenv("MIN_RESULT_SCORE", "1.2"))  # below this, treat as no-results
 
 
 def get_es() -> Elasticsearch:
@@ -42,11 +37,11 @@ def get_es() -> Elasticsearch:
     # local dev typically without TLS; keep warnings quiet if users enable TLS later
     kwargs["verify_certs"] = False
     kwargs["ssl_show_warn"] = False
-
     return Elasticsearch(**kwargs)
 
 
 es = get_es()
+
 
 # -----------------------
 # Models
@@ -89,9 +84,10 @@ class TrendingResponse(BaseModel):
 
 class ZeroStateResponse(BaseModel):
     city_id: Optional[str]
-    recent_searches: List[str] = []
-    trending: List[EntityOut] = []
-    popular_entities: List[EntityOut] = []
+    recent_searches: List[str]
+    trending_searches: List[EntityOut]
+    trending_localities: List[EntityOut]
+    popular_entities: List[EntityOut]
 
 
 class AdminOk(BaseModel):
@@ -113,8 +109,10 @@ class ParseResponse(BaseModel):
     currency: str = "INR"
     ok: bool = True
 
+
 class EventOk(BaseModel):
     ok: bool = True
+    query_id: Optional[str] = None
 
 
 class SearchEventIn(BaseModel):
@@ -123,18 +121,19 @@ class SearchEventIn(BaseModel):
     normalized_query: str
     city_id: Optional[str] = None
     context_url: Optional[str] = None
-    timestamp: str  # ISO string
+    timestamp: str
 
 
 class ClickEventIn(BaseModel):
     query_id: str
     entity_id: str
     entity_type: str
-    rank: Optional[int] = None
+    rank: int
     url: str
     city_id: Optional[str] = None
     context_url: Optional[str] = None
-    timestamp: str  # ISO string
+    timestamp: str
+
 
 # -----------------------
 # Helpers
@@ -181,13 +180,11 @@ def parse_query(q: str) -> ParseResponse:
     if m:
         bhk = int(m.group(1))
 
-    # locality hint: grab token after "in <...>" up to "under/below/near/for"
     locality_hint = None
     m = re.search(r"\bin\s+([a-z0-9 \-]+?)(?:\s+\bunder\b|\s+\bbelow\b|\s+\bfor\b|\s+\bnear\b|$)", s)
     if m:
         locality_hint = m.group(1).strip()
 
-    # budget/rent extraction: e.g. "under 80L", "under 50k"
     max_price = None
     max_rent = None
 
@@ -238,7 +235,6 @@ def build_mapping() -> Dict[str, Any]:
 
 
 def seed_docs() -> List[Dict[str, Any]]:
-    # Mirrors your earlier working demo dataset
     return [
         {
             "id": "builder_dlf", "entity_type": "builder", "name": "DLF",
@@ -246,7 +242,6 @@ def seed_docs() -> List[Dict[str, Any]]:
             "canonical_url": "/builders/dlf", "popularity_score": 95.0
         },
         {
-            "oved": "city_noida" if False else "city_noida",  # no-op; keeps file stable even if pasted
             "id": "city_noida", "entity_type": "city", "name": "Noida",
             "name_norm": "noida", "city": "Noida", "city_id": "city_noida", "parent_name": "",
             "canonical_url": "/noida", "popularity_score": 90.0
@@ -391,25 +386,23 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(q: str, city_id: Optional[str] = None) -> str:
-    # frontend SERP route is /search?q=...
-    base = f"/search?q={quote_plus(q)}"
+def build_serp_url(q: str, city_id: Optional[str]) -> str:
+    url = f"/search?q={quote_plus(q)}"
     if city_id:
-        base += f"&city_id={quote_plus(city_id)}"
-    return base
+        url += f"&city_id={quote_plus(city_id)}"
+    return url
 
-EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "backend/.events"))
 
-def _append_jsonl(path: Path, payload: dict) -> None:
+# -----------------------
+# Event logging (local dev)
+# -----------------------
+EVENTS_DIR = (Path(__file__).resolve().parents[1] / ".events")  # backend/.events
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-def build_serp_url(q: str, city_id: Optional[str] = None) -> str:
-    u = f"/search?q={quote_plus(q)}"
-    if city_id:
-        u += f"&city_id={quote_plus(city_id)}"
-    return u
 
 
 # -----------------------
@@ -435,6 +428,9 @@ def health():
     return {"status": "ok"}
 
 
+# -----------------------
+# Admin
+# -----------------------
 @admin.get("/ping-es", response_model=AdminOk)
 def ping_es():
     info = es.info()
@@ -467,6 +463,9 @@ def seed():
     return AdminOk(ok=True, seeded=len(docs), index_count=int(count))
 
 
+# -----------------------
+# Search
+# -----------------------
 @search.get("", response_model=SuggestResponse)
 def search_serp(
     q: str = Query(..., min_length=1),
@@ -474,14 +473,11 @@ def search_serp(
     limit: int = 10,
 ):
     hits, did_you_mean = es_search_entities(q=q, limit=limit, city_id=city_id)
-    max_score = max((float(h.get("_score") or 0.0) for h in hits), default=0.0)
     entities = [hit_to_entity(h) for h in hits]
     groups = group_entities(entities)
 
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
-    # If we only have very low-confidence fuzzy hits, treat it as a no-results state.
-    if (not hits) or (max_score < MIN_RESULT_SCORE) or (sum(len(v) for v in groups.values()) == 0):
-        groups = {k: [] for k in groups.keys()}
+    if sum(len(v) for v in groups.values()) == 0:
         fallbacks["relaxed_used"] = True
         fallbacks["reason"] = "no_results"
         fallbacks["trending"] = fetch_trending(city_id=city_id, limit=8)
@@ -506,14 +502,11 @@ def suggest(
     limit: int = 10,
 ):
     hits, did_you_mean = es_search_entities(q=q, limit=limit, city_id=city_id)
-    max_score = max((float(h.get("_score") or 0.0) for h in hits), default=0.0)
     entities = [hit_to_entity(h) for h in hits]
     groups = group_entities(entities)
 
     fallbacks: Dict[str, Any] = {"relaxed_used": False, "trending": [], "reason": None}
-    # If we only have very low-confidence fuzzy hits, treat it as a no-results state.
-    if (not hits) or (max_score < MIN_RESULT_SCORE) or (sum(len(v) for v in groups.values()) == 0):
-        groups = {k: [] for k in groups.keys()}
+    if sum(len(v) for v in groups.values()) == 0:
         fallbacks["relaxed_used"] = True
         fallbacks["reason"] = "no_results"
         fallbacks["trending"] = fetch_trending(city_id=city_id, limit=8)
@@ -530,104 +523,130 @@ def suggest(
         },
     )
 
+
+@search.get("/zero-state", response_model=ZeroStateResponse)
+def zero_state(
+    city_id: Optional[str] = None,
+    limit: int = 8,
+):
+    trending = fetch_trending(city_id=city_id, limit=limit)
+    loc_pool = fetch_trending(city_id=city_id, limit=max(limit * 2, 10))
+    trending_localities = [e for e in loc_pool if e.entity_type in ("city", "locality", "micromarket")][: max(2, limit // 2)]
+    return ZeroStateResponse(
+        city_id=city_id,
+        recent_searches=[],
+        trending_searches=trending,
+        trending_localities=trending_localities,
+        popular_entities=trending,
+    )
+
+
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(q: str, city_id: Optional[str] = None):
-    # Constraint-heavy queries always go to SERP (but with a URL now)
+def resolve(
+    q: str = Query(..., min_length=1),
+    city_id: Optional[str] = None,
+):
+    nq = normalize_q(q)
+
+    # 1) constraints -> SERP (always return url)
     if is_constraint_heavy(q):
         return ResolveResponse(
             action="serp",
             query=q,
-            normalized_query=q,
-            url=build_serp_url(q, city_id=city_id),
+            normalized_query=nq,
+            url=build_serp_url(q, city_id),
             reason="constraint_heavy",
         )
 
-    hits, _ = es_search_entities(q=q, limit=8, city_id=city_id)
-
-    if not hits:
+    # 2) GLOBAL lookup first to detect same-name collisions across cities
+    global_hits, _ = es_search_entities(q=q, limit=10, city_id=None)
+    if not global_hits:
         return ResolveResponse(
             action="serp",
             query=q,
-            normalized_query=q,
-            url=build_serp_url(q, city_id=city_id),
+            normalized_query=nq,
+            url=build_serp_url(q, city_id),
             reason="no_results",
         )
 
-    # Convert hits -> entities
-    entities = [hit_to_entity(h) for h in hits]
+    # candidates where name_norm == query norm (strong signal for “same-name”)
+    same_name_hits: List[Dict[str, Any]] = []
+    for h in global_hits:
+        src = h.get("_source", {}) or {}
+        name_norm = (src.get("name_norm") or "").strip().lower()
+        if not name_norm:
+            name_norm = normalize_q(str(src.get("name") or ""))
+        if name_norm == nq:
+            same_name_hits.append(h)
+
+    same_name_candidates = [hit_to_entity(h) for h in same_name_hits]
+
+    # if same-name exists across >=2 different cities -> disambiguate
+    city_set = {c.city_id for c in same_name_candidates if c.city_id}
+    if len(city_set) >= 2:
+        # ---- Step 2.4C: if city_id is present, shortcut to the matching city candidate
+        if city_id:
+            scoped = [c for c in same_name_candidates if c.city_id == city_id]
+            if len(scoped) == 1:
+                chosen = scoped[0]
+                return ResolveResponse(
+                    action="redirect",
+                    query=q,
+                    normalized_query=nq,
+                    url=chosen.canonical_url,
+                    match=chosen,
+                    reason="city_scoped_same_name",
+                    debug={"city_id": city_id, "candidate_count": len(same_name_candidates)},
+                )
+
+        # no city_id (or no unique scoped candidate) -> true disambiguation response
+        return ResolveResponse(
+            action="disambiguate",
+            query=q,
+            normalized_query=nq,
+            candidates=same_name_candidates,
+            reason="same_name",
+            debug={"candidate_count": len(same_name_candidates), "cities": sorted(list(city_set))},
+        )
+
+    # 3) normal resolver scoring (city-aware search)
+    hits, _ = es_search_entities(q=q, limit=5, city_id=city_id)
+    if not hits:
+        # fallback to global for serp; still return url
+        return ResolveResponse(
+            action="serp",
+            query=q,
+            normalized_query=nq,
+            url=build_serp_url(q, city_id),
+            reason="no_results",
+        )
+
     top = hits[0]
     second = hits[1] if len(hits) > 1 else None
-
     top_score = float(top.get("_score") or 0.0)
     second_score = float(second.get("_score") or 0.0) if second else 0.0
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
 
-    top_entity = entities[0]
-
-    # ---- Disambiguation rule #1: same-name collisions (only when city_id is NOT provided)
-    # Example: "Baner" exists in multiple cities (or multiple localities/projects)
-    if not city_id and len(entities) >= 2:
-        top_name_norm = normalize_q(top_entity.name)
-        same_name = [
-            e for e in entities
-            if normalize_q(e.name) == top_name_norm
-            and e.entity_type in ("locality", "micromarket", "project", "city")
-        ]
-        # If we found multiple same-name candidates, force disambiguation UI
-        if len(same_name) >= 2:
-            return ResolveResponse(
-                action="disambiguate",
-                query=q,
-                normalized_query=q,
-                candidates=same_name[:6],
-                reason="same_name",
-                debug={"top_score": top_score, "second_score": second_score, "gap": gap},
-            )
-
-    # ---- Confident redirect (existing logic)
-    # threshold tuned for demo; refine later with evals
-    match = top_entity
+    match = hit_to_entity(top)
     if top_score >= 5.0 and gap >= 0.30:
         return ResolveResponse(
             action="redirect",
             query=q,
-            normalized_query=q,
+            normalized_query=nq,
             url=match.canonical_url,
             match=match,
+            reason="confident",
             debug={"top_score": top_score, "second_score": second_score, "gap": gap},
         )
 
-    # ---- Disambiguation rule #2: close-call ambiguity (top2 too close)
-    # If the top results are close, send candidates to disambiguation instead of SERP
-    if len(entities) >= 2 and gap < 0.25:
-        return ResolveResponse(
-            action="disambiguate",
-            query=q,
-            normalized_query=q,
-            candidates=entities[:6],
-            reason="ambiguous_close_scores",
-            debug={"top_score": top_score, "second_score": second_score, "gap": gap},
-        )
-
-    # Default → SERP (with URL)
     return ResolveResponse(
         action="serp",
         query=q,
-        normalized_query=q,
-        url=build_serp_url(q, city_id=city_id),
+        normalized_query=nq,
+        url=build_serp_url(q, city_id),
         reason="ambiguous",
         debug={"top_score": top_score, "second_score": second_score, "gap": gap},
     )
-
-
-@search.get("/zero-state", response_model=ZeroStateResponse)
-def zero_state(city_id: Optional[str] = None, limit: int = 8):
-    """Zero-state payload for an empty search box.
-
-    Note: recents are currently maintained client-side (localStorage).
-    """
-    items = fetch_trending(city_id=city_id, limit=limit)
-    return ZeroStateResponse(city_id=city_id, recent_searches=[], trending=items, popular_entities=items)
 
 
 @search.get("/trending", response_model=TrendingResponse)
@@ -640,15 +659,21 @@ def trending(city_id: Optional[str] = None, limit: int = 5):
 def parse(q: str = Query(..., min_length=1)):
     return parse_query(q)
 
+
+# -----------------------
+# Events
+# -----------------------
 @events.post("/search", response_model=EventOk)
-def log_search(evt: SearchEventIn):
-    _append_jsonl(EVENTS_DIR / "search.jsonl", evt.model_dump())
+def log_search(evt: SearchEventIn = Body(...)):
+    payload = evt.model_dump()
+    _append_jsonl(EVENTS_DIR / "search.jsonl", payload)
     return EventOk(ok=True)
 
 
 @events.post("/click", response_model=EventOk)
-def log_click(evt: ClickEventIn):
-    _append_jsonl(EVENTS_DIR / "click.jsonl", evt.model_dump())
+def log_click(evt: ClickEventIn = Body(...)):
+    payload = evt.model_dump()
+    _append_jsonl(EVENTS_DIR / "click.jsonl", payload)
     return EventOk(ok=True)
 
 
@@ -656,4 +681,3 @@ def log_click(evt: ClickEventIn):
 app.include_router(admin, prefix="/api/v1/admin")
 app.include_router(search, prefix="/api/v1/search")
 app.include_router(events, prefix="/api/v1/events")
-app.include_router(search, prefix="/api/v1/search")

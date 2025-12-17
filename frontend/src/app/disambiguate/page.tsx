@@ -1,149 +1,110 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { apiGet } from "@/lib/api";
+import type { ResolveResponse } from "@/lib/types";
 
-type EntityOut = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
+type SP = {
+  q?: string;
   city_id?: string;
-  parent_name?: string;
-  canonical_url: string;
-  score?: number | null;
-  popularity_score?: number | null;
+  qid?: string;
+  context_url?: string;
 };
 
-type ResolveResponse = {
-  action: "redirect" | "serp" | "disambiguate";
-  query: string;
-  normalized_query: string;
-  url?: string | null;
-  match?: EntityOut | null;
-  candidates?: EntityOut[] | null;
-  reason?: string | null;
-  debug?: Record<string, any> | null;
-};
-
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
-
-function goUrl(params: {
+function buildGoHref(args: {
   url: string;
-  qid?: string | null;
-  entity_id?: string | null;
-  entity_type?: string | null;
-  rank?: number | null;
-  city_id?: string | null;
-  context_url?: string | null;
+  qid?: string;
+  entity_id?: string;
+  entity_type?: string;
+  rank?: number;
+  city_id?: string;
+  context_url?: string;
 }) {
-  const sp = new URLSearchParams();
-  sp.set("url", params.url);
-  if (params.qid) sp.set("qid", params.qid);
-  if (params.entity_id) sp.set("entity_id", params.entity_id);
-  if (params.entity_type) sp.set("entity_type", params.entity_type);
-  if (typeof params.rank === "number") sp.set("rank", String(params.rank));
-  if (params.city_id) sp.set("city_id", params.city_id);
-  if (params.context_url) sp.set("context_url", params.context_url);
-  return `/go?${sp.toString()}`;
+  const p = new URLSearchParams();
+  p.set("url", args.url);
+  if (args.qid) p.set("qid", args.qid);
+  if (args.entity_id) p.set("entity_id", args.entity_id);
+  if (args.entity_type) p.set("entity_type", args.entity_type);
+  if (typeof args.rank === "number") p.set("rank", String(args.rank));
+  if (args.city_id) p.set("city_id", args.city_id);
+  if (args.context_url) p.set("context_url", args.context_url);
+  return `/go?${p.toString()}`;
 }
 
 export default async function DisambiguatePage({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; qid?: string; city_id?: string; context_url?: string }>;
+  searchParams: Promise<SP>;
 }) {
   const sp = await searchParams;
+
   const q = (sp.q || "").trim();
-  const qid = (sp.qid || "").trim();
-  const cityId = (sp.city_id || "").trim();
-  const contextUrl = (sp.context_url || "").trim();
+  const city_id = (sp.city_id || "").trim() || undefined;
+  const qid = (sp.qid || "").trim() || undefined;
+  const context_url = (sp.context_url || "").trim() || "/";
 
   if (!q) {
-    redirect("/");
-  }
-
-  const url =
-    `${API_BASE}/api/v1/search/resolve?q=${encodeURIComponent(q)}` +
-    (cityId ? `&city_id=${encodeURIComponent(cityId)}` : "") +
-    (contextUrl ? `&context_url=${encodeURIComponent(contextUrl)}` : "");
-
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
     return (
-      <main className="p-6">
-        <h1 className="text-xl font-semibold">Choose one</h1>
-        <p className="mt-2 opacity-70">Resolve API failed ({r.status}).</p>
+      <main style={{ padding: 24 }}>
+        <h1 style={{ fontSize: 20, fontWeight: 700 }}>Choose a result</h1>
+        <p style={{ marginTop: 8 }}>Missing query.</p>
+        <p style={{ marginTop: 8 }}>
+          <Link href="/">Go back</Link>
+        </p>
       </main>
     );
   }
 
-  const data = (await r.json()) as ResolveResponse;
+  const res = await apiGet<ResolveResponse>("/search/resolve", { q, city_id });
 
-  // If user landed here but backend no longer wants disambiguation, route correctly
-  if (data.action === "redirect" && data.url) {
-    const m = data.match || null;
-    redirect(
-      goUrl({
-        url: data.url,
-        qid: qid || null,
-        entity_id: m?.id || null,
-        entity_type: m?.entity_type || null,
-        rank: 1,
-        city_id: cityId || null,
-        context_url: contextUrl || null,
-      })
-    );
-  }
+  if (res.action === "redirect" && res.url) redirect(res.url);
+  if (res.action === "serp" && res.url) redirect(res.url);
 
-  if (data.action === "serp" && data.url) {
-    redirect(data.url);
-  }
-
-  const candidates = data.candidates || [];
+  const candidates = res.candidates || [];
 
   return (
-    <main className="p-6">
-      <h1 className="text-xl font-semibold">Choose one</h1>
-      <div className="mt-2 text-sm opacity-80">
-        Query: <span className="font-medium">{q}</span>
-      </div>
+    <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 20, fontWeight: 700 }}>Which “{q}” did you mean?</h1>
+      <p style={{ marginTop: 6, opacity: 0.8 }}>
+        Multiple matches found. Pick one to continue.
+      </p>
 
       {candidates.length === 0 ? (
-        <div className="mt-6 rounded border p-4">
-          <div className="font-medium">No candidates returned.</div>
-          <div className="mt-1 text-sm opacity-70">
-            Try{" "}
-            <Link className="underline" href={`/search?q=${encodeURIComponent(q)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`}>
-              Search results
-            </Link>
-            .
-          </div>
+        <div style={{ marginTop: 16 }}>
+          <p>No candidates returned.</p>
+          <p style={{ marginTop: 8 }}>
+            <Link href={`/search?q=${encodeURIComponent(q)}`}>See all results</Link>
+          </p>
         </div>
       ) : (
-        <div className="mt-6 rounded border divide-y">
-          {candidates.map((c, idx) => {
-            const subtitle = [c.parent_name, c.city].filter(Boolean).join(" • ");
-            return (
+        <ul style={{ marginTop: 16, paddingLeft: 18 }}>
+          {candidates.map((c, idx) => (
+            <li key={c.id} style={{ marginBottom: 10 }}>
               <Link
-                key={c.id}
-                className="block px-4 py-3 hover:bg-black/5"
-                href={goUrl({
+                href={buildGoHref({
                   url: c.canonical_url,
-                  qid: qid || null,
+                  qid,
                   entity_id: c.id,
                   entity_type: c.entity_type,
                   rank: idx + 1,
-                  city_id: cityId || null,
-                  context_url: contextUrl || null,
+                  city_id,
+                  context_url,
                 })}
+                style={{ textDecoration: "underline" }}
               >
-                <div className="font-medium text-sm">{c.name}</div>
-                <div className="text-xs opacity-70">{subtitle}</div>
+                {c.name}
               </Link>
-            );
-          })}
-        </div>
+              <span style={{ marginLeft: 8, opacity: 0.8 }}>
+                — {c.city}
+                {c.parent_name ? ` · ${c.parent_name}` : ""}
+              </span>
+            </li>
+          ))}
+        </ul>
       )}
+
+      <div style={{ marginTop: 18 }}>
+        <Link href={`/search?q=${encodeURIComponent(q)}`}>See all results</Link>
+      </div>
     </main>
   );
 }

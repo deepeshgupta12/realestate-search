@@ -1,30 +1,19 @@
-export type EntityType =
-  | "city"
-  | "micromarket"
-  | "locality"
-  | "locality_overview"
-  | "rate_page"
-  | "listing_page"
-  | "project"
-  | "property_pdp"
-  | "builder";
-
 export type EntityOut = {
   id: string;
-  entity_type: EntityType;
+  entity_type: string;
   name: string;
-  city: string;
-  city_id: string;
-  parent_name: string;
+  city?: string;
+  city_id?: string;
+  parent_name?: string;
   canonical_url: string;
-  score: number | null;
-  popularity_score: number | null;
+  score?: number | null;
+  popularity_score?: number | null;
 };
 
 export type SuggestResponse = {
   q: string;
   normalized_q: string;
-  did_you_mean: string | null;
+  did_you_mean?: string | null;
   groups: {
     locations: EntityOut[];
     projects: EntityOut[];
@@ -33,10 +22,28 @@ export type SuggestResponse = {
     property_pdps: EntityOut[];
   };
   fallbacks?: {
-    relaxed_used?: boolean;
-    trending?: EntityOut[];
+    relaxed_used: boolean;
+    trending: EntityOut[];
     reason?: string | null;
-  };
+  } | null;
+};
+
+export type ResolveResponse = {
+  action: "redirect" | "serp" | "disambiguate";
+  query: string;
+  normalized_query: string;
+
+  // redirect/serp
+  url?: string | null;
+
+  // redirect
+  match?: EntityOut | null;
+
+  // disambiguate
+  candidates?: EntityOut[] | null;
+
+  reason?: string | null;
+  debug?: Record<string, any> | null;
 };
 
 export type ZeroStateResponse = {
@@ -46,37 +53,3 @@ export type ZeroStateResponse = {
   trending_localities: EntityOut[];
   popular_entities: EntityOut[];
 };
-
-export type ResolveResponse =
-  | {
-      action: "redirect";
-      query: string;
-      normalized_query: string;
-      url: string;
-      match: EntityOut | null;
-      candidates: null;
-      reason: string | null;
-      debug?: unknown;
-    }
-  | {
-      action: "serp";
-      query: string;
-      normalized_query: string;
-      url: string;
-      match: null;
-      candidates: null;
-      reason: string | null;
-      debug?: unknown;
-    }
-  | {
-      action: "disambiguate";
-      query: string;
-      normalized_query: string;
-      url: null;
-      match: null;
-      candidates: EntityOut[];
-      reason: string | null;
-      debug?: unknown;
-    };
-
-export type EventOk = { ok: boolean };

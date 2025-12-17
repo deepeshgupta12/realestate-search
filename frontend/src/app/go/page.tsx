@@ -1,77 +1,67 @@
-"use client";
+import { redirect } from "next/navigation";
 
-import React, { useEffect, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-import { apiPost } from "@/lib/api";
-import type { EventOk } from "@/lib/types";
+type SP = {
+  url?: string;
+  qid?: string;
+  entity_id?: string;
+  entity_type?: string;
+  rank?: string;
+  city_id?: string;
+  context_url?: string;
+};
 
-export default function GoPage() {
-  const router = useRouter();
-  const sp = useSearchParams();
+function normalizeApiBase(raw?: string) {
+  const base = (raw || "http://localhost:8000").replace(/\/+$/, "");
+  // accept either:
+  // - http://localhost:8000
+  // - http://localhost:8000/api/v1
+  if (base.endsWith("/api/v1")) return base;
+  return `${base}/api/v1`;
+}
 
-  const url = sp.get("url") || "";
-  const qid = sp.get("qid") || "";
-  const entityId = sp.get("entity_id");
-  const entityType = sp.get("entity_type");
-  const rankStr = sp.get("rank");
-  const cityId = sp.get("city_id");
-  const contextUrl = sp.get("context_url");
+async function postJson(url: string, body: any) {
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch {
+    // best-effort logging; never block navigation
+  }
+}
 
-  const [status, setStatus] = useState<string>("Click logged.");
+export default async function GoPage({
+  searchParams,
+}: {
+  searchParams: Promise<SP>;
+}) {
+  const sp = await searchParams;
 
-  useEffect(() => {
-    let cancelled = false;
+  const url = (sp.url || "").trim();
+  if (!url) redirect("/");
 
-    (async () => {
-      if (!url) {
-        setStatus("Missing target URL.");
-        return;
-      }
+  const qid = (sp.qid || "").trim() || null;
+  const entity_id = (sp.entity_id || "").trim() || null;
+  const entity_type = (sp.entity_type || "").trim() || null;
 
-      try {
-        await apiPost<EventOk>("/events/click", {
-          query_id: qid || null,
-          entity_id: entityId || null,
-          entity_type: entityType || null,
-          rank: rankStr ? Number(rankStr) : null,
-          url,
-          city_id: cityId || null,
-          context_url: contextUrl || null,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (e: any) {
-        if (!cancelled) setStatus(`Click logging failed (non-blocking): ${String(e?.message || e)}`);
-      }
+  const rank = sp.rank ? Number(sp.rank) : null;
+  const city_id = (sp.city_id || "").trim() || null;
+  const context_url = (sp.context_url || "").trim() || null;
 
-      if (!cancelled) {
-        window.location.href = url;
-      }
-    })();
+  const apiBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [url, qid, entityId, entityType, rankStr, cityId, contextUrl]);
+  await postJson(`${apiBase}/events/click`, {
+    query_id: qid,
+    entity_id,
+    entity_type,
+    rank,
+    url,
+    city_id,
+    context_url,
+    timestamp: new Date().toISOString(),
+  });
 
-  return (
-    <main style={{ padding: 24 }}>
-      <h1>Go</h1>
-      <div style={{ opacity: 0.8 }}>{status}</div>
-
-      <pre style={{ marginTop: 16, padding: 16, border: "1px solid rgba(255,255,255,0.15)", borderRadius: 8 }}>
-{`Target URL: ${url || "(missing)"}
-qid: ${qid || "(missing)"}
-entity: ${entityType || "-"} / ${entityId || "-"}
-rank: ${rankStr || "-"}
-`}
-      </pre>
-
-      <button
-        style={{ marginTop: 12, padding: "8px 12px" }}
-        onClick={() => router.push("/")}
-      >
-        Back
-      </button>
-    </main>
-  );
+  redirect(url);
 }
