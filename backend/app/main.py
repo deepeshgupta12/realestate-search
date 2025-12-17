@@ -475,11 +475,30 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(q: str, city_id: Optional[str]) -> str:
-    url = f"/search?q={quote_plus(q)}"
+def build_serp_url(
+    q: str,
+    city_id: str | None = None,
+    qid: str | None = None,
+    context_url: str | None = None,
+) -> str:
+    """
+    Build a frontend SERP URL.
+    Supports optional tracking params (qid/context_url) used by newer resolve() logic.
+    """
+
+    # Local import to avoid messing with your top-of-file imports if they differ.
+    from urllib.parse import urlencode, quote_plus
+
+    params: dict[str, str] = {"q": q}
+
     if city_id:
-        url += f"&city_id={quote_plus(city_id)}"
-    return url
+        params["city_id"] = city_id
+    if qid:
+        params["qid"] = qid
+    if context_url:
+        params["context_url"] = context_url
+
+    return "/search?" + urlencode(params, quote_via=quote_plus)
 
 
 # -----------------------
