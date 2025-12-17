@@ -1,131 +1,173 @@
+// frontend/src/app/search/page.tsx
 import Link from "next/link";
-import type { SuggestResponse } from "@/lib/types";
+import { apiGet } from "@/lib/api";
+import type { EntityOut, SuggestResponse } from "@/lib/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+type SP = Record<string, string | string[] | undefined>;
+
+function first(v: string | string[] | undefined): string | undefined {
+  if (!v) return undefined;
+  return Array.isArray(v) ? v[0] : v;
+}
+
+function enc(v: string): string {
+  return encodeURIComponent(v);
+}
+
+function makeQid(): string {
+  // Node/Edge safe in Next server components
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g: any = globalThis as any;
+  if (g?.crypto?.randomUUID) return g.crypto.randomUUID();
+  // fallback (rare)
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function buildGoHref(args: {
+  url: string;
+  qid: string;
+  entity: EntityOut;
+  rank: number;
+  city_id?: string;
+  context_url?: string;
+}) {
+  const { url, qid, entity, rank, city_id, context_url } = args;
+
+  const qp: string[] = [];
+  qp.push(`url=${enc(url)}`);
+  qp.push(`qid=${enc(qid)}`);
+  qp.push(`entity_id=${enc(entity.id)}`);
+  qp.push(`entity_type=${enc(entity.entity_type)}`);
+  qp.push(`rank=${enc(String(rank))}`);
+
+  if (city_id) qp.push(`city_id=${enc(city_id)}`);
+  if (context_url) qp.push(`context_url=${enc(context_url)}`);
+
+  return `/go?${qp.join("&")}`;
+}
+
+function flattenGroups(groups: SuggestResponse["groups"]): EntityOut[] {
+  const out: EntityOut[] = [];
+  (groups.locations || []).forEach((x) => out.push(x));
+  (groups.projects || []).forEach((x) => out.push(x));
+  (groups.builders || []).forEach((x) => out.push(x));
+  (groups.rate_pages || []).forEach((x) => out.push(x));
+  (groups.property_pdps || []).forEach((x) => out.push(x));
+  return out;
+}
 
 export default async function SearchPage({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; city_id?: string; qid?: string }>;
+  searchParams: SP | Promise<SP>;
 }) {
-  const sp = await searchParams;
-  const q = (sp.q || "").trim();
-  const city_id = (sp.city_id || "").trim();
-  const qid = (sp.qid || "").trim();
+  const sp: SP =
+    typeof (searchParams as Promise<SP>)?.then === "function"
+      ? await (searchParams as Promise<SP>)
+      : (searchParams as SP);
+
+  const q = (first(sp.q) || "").trim();
+  const city_id = first(sp.city_id) || undefined;
+  const context_url =
+    first(sp.context_url) || (q ? `/search?q=${enc(q)}` : "/search");
+
+  const qid = first(sp.qid) || makeQid();
 
   if (!q) {
     return (
-      <main className="mx-auto max-w-3xl p-6">
-        <h1 className="text-xl font-semibold">Search</h1>
-        <p className="mt-2 text-gray-600">Missing query. Try /search?q=baner</p>
+      <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px" }}>
+        <h1 style={{ fontSize: 22, fontWeight: 700 }}>Search</h1>
+        <p style={{ opacity: 0.8 }}>Type in the search bar to see results.</p>
       </main>
     );
   }
 
-  const u = new URL(`${API_BASE}/api/v1/search`);
-  u.searchParams.set("q", q);
-  u.searchParams.set("limit", "20");
-  if (city_id) u.searchParams.set("city_id", city_id);
+  const data = await apiGet<SuggestResponse>("/api/v1/search", {
+    q,
+    limit: 20,
+    ...(city_id ? { city_id } : {}),
+  });
 
-  const res = await fetch(u.toString(), { cache: "no-store" });
-  const data = (await res.json()) as SuggestResponse;
-
-  const sections = [
-    { key: "locations", title: "Locations", items: data.groups.locations },
-    { key: "projects", title: "Projects", items: data.groups.projects },
-    { key: "builders", title: "Builders", items: data.groups.builders },
-    { key: "rate_pages", title: "Property Rates", items: data.groups.rate_pages },
-    { key: "property_pdps", title: "Properties", items: data.groups.property_pdps },
-  ].filter((s) => s.items.length > 0);
-
-  function goHref(args: {
-    url: string;
-    entity_id?: string;
-    entity_type?: string;
-    rank: number;
-  }) {
-    const go = new URL("http://example.com/go");
-    go.searchParams.set("url", args.url);
-    if (qid) go.searchParams.set("qid", qid);
-    go.searchParams.set("rank", String(args.rank));
-    if (args.entity_id) go.searchParams.set("entity_id", args.entity_id);
-    if (args.entity_type) go.searchParams.set("entity_type", args.entity_type);
-    if (city_id) go.searchParams.set("city_id", city_id);
-    go.searchParams.set("context_url", `/search?q=${encodeURIComponent(q)}`);
-    return go.pathname + "?" + go.searchParams.toString();
-  }
+  const all = flattenGroups(data.groups);
+  const hasAny = all.length > 0;
 
   return (
-    <main className="mx-auto max-w-3xl p-6">
-      <h1 className="text-xl font-semibold">Results for “{q}”</h1>
+    <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+        <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>
+          Results for “{q}”
+        </h1>
+        <span style={{ opacity: 0.7, fontSize: 13 }}>qid: {qid}</span>
+      </div>
 
-      {data.did_you_mean ? (
-        <p className="mt-2 text-sm text-gray-600">
-          Did you mean: <span className="font-medium">{data.did_you_mean}</span>
-        </p>
-      ) : null}
-
-      {sections.length === 0 ? (
-        <div className="mt-6 rounded border border-gray-200 p-4">
-          <p className="text-gray-700">No results found.</p>
+      {!hasAny ? (
+        <>
+          <div style={{ marginTop: 14, padding: 12, border: "1px solid #eee" }}>
+            <div style={{ fontWeight: 700 }}>No results found</div>
+            <div style={{ opacity: 0.8, marginTop: 6 }}>
+              Try a different spelling, or explore trending.
+            </div>
+          </div>
 
           {data.fallbacks?.trending?.length ? (
             <>
-              <p className="mt-3 text-sm font-semibold text-gray-600">Trending</p>
-              <ul className="mt-2 space-y-2">
-                {data.fallbacks.trending.map((t, i) => (
-                  <li key={t.id} className="rounded border border-gray-100 p-3">
+              <h2 style={{ marginTop: 18, fontSize: 16 }}>Trending</h2>
+              <ul style={{ marginTop: 8 }}>
+                {data.fallbacks.trending.map((e, i) => (
+                  <li key={e.id} style={{ margin: "8px 0" }}>
                     <Link
-                      href={goHref({
-                        url: t.canonical_url,
-                        entity_id: t.id,
-                        entity_type: t.entity_type,
+                      href={buildGoHref({
+                        url: e.canonical_url,
+                        qid,
+                        entity: e,
                         rank: i + 1,
+                        city_id,
+                        context_url,
                       })}
-                      className="text-sm font-medium hover:underline"
+                      style={{ textDecoration: "none" }}
                     >
-                      {t.name}
+                      <span style={{ fontWeight: 600 }}>{e.name}</span>{" "}
+                      <span style={{ opacity: 0.7 }}>
+                        ({e.entity_type}
+                        {e.city ? ` • ${e.city}` : ""})
+                      </span>
                     </Link>
-                    <div className="mt-1 text-xs text-gray-500">
-                      {t.entity_type}
-                      {t.city ? ` · ${t.city}` : ""}
-                    </div>
                   </li>
                 ))}
               </ul>
             </>
           ) : null}
-        </div>
+        </>
       ) : (
-        <div className="mt-6 space-y-6">
-          {sections.map((sec) => (
-            <section key={sec.key}>
-              <h2 className="text-sm font-semibold text-gray-600">{sec.title}</h2>
-              <ul className="mt-2 space-y-2">
-                {sec.items.map((it, idx) => (
-                  <li key={it.id} className="rounded border border-gray-100 p-3">
-                    <Link
-                      href={goHref({
-                        url: it.canonical_url,
-                        entity_id: it.id,
-                        entity_type: it.entity_type,
-                        rank: idx + 1,
-                      })}
-                      className="text-sm font-medium hover:underline"
-                    >
-                      {it.name}
-                    </Link>
-                    <div className="mt-1 text-xs text-gray-500">
-                      {it.entity_type}
-                      {it.parent_name ? ` · ${it.parent_name}` : ""}
-                      {it.city ? ` · ${it.city}` : ""}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ))}
-        </div>
+        <>
+          <h2 style={{ marginTop: 18, fontSize: 16 }}>All matches</h2>
+          <ul style={{ marginTop: 8 }}>
+            {all.map((e, i) => (
+              <li key={e.id} style={{ margin: "10px 0" }}>
+                <Link
+                  href={buildGoHref({
+                    url: e.canonical_url,
+                    qid,
+                    entity: e,
+                    rank: i + 1,
+                    city_id,
+                    context_url,
+                  })}
+                  style={{ textDecoration: "none" }}
+                >
+                  <div style={{ fontWeight: 700 }}>{e.name}</div>
+                  <div style={{ opacity: 0.7, fontSize: 13 }}>
+                    {e.entity_type}
+                    {e.city ? ` • ${e.city}` : ""}
+                    {e.parent_name ? ` • ${e.parent_name}` : ""}
+                    {" • "}
+                    {e.canonical_url}
+                  </div>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
     </main>
   );
