@@ -1,67 +1,76 @@
+// frontend/src/app/go/page.tsx
 import { redirect } from "next/navigation";
 
-type SP = {
-  url?: string;
-  qid?: string;
-  entity_id?: string;
-  entity_type?: string;
-  rank?: string;
-  city_id?: string;
-  context_url?: string;
-};
+type SP = Record<string, string | string[] | undefined>;
 
-function normalizeApiBase(raw?: string) {
-  const base = (raw || "http://localhost:8000").replace(/\/+$/, "");
-  // accept either:
-  // - http://localhost:8000
-  // - http://localhost:8000/api/v1
-  if (base.endsWith("/api/v1")) return base;
-  return `${base}/api/v1`;
+function first(v: string | string[] | undefined): string | undefined {
+  if (!v) return undefined;
+  return Array.isArray(v) ? v[0] : v;
 }
 
-async function postJson(url: string, body: any) {
+function apiBase(): string {
+  return (
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    process.env.API_BASE_URL ||
+    "http://127.0.0.1:8000"
+  );
+}
+
+async function postClick(payload: Record<string, any>) {
+  const url = new URL("/api/v1/events/click", apiBase()).toString();
   try {
     await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
       cache: "no-store",
+      body: JSON.stringify(payload),
     });
   } catch {
-    // best-effort logging; never block navigation
+    // do not block navigation on logging failures
   }
 }
 
 export default async function GoPage({
   searchParams,
 }: {
-  searchParams: Promise<SP>;
+  searchParams: SP | Promise<SP>;
 }) {
-  const sp = await searchParams;
+  const sp: SP =
+    typeof (searchParams as Promise<SP>)?.then === "function"
+      ? await (searchParams as Promise<SP>)
+      : (searchParams as SP);
 
-  const url = (sp.url || "").trim();
-  if (!url) redirect("/");
+  const url = first(sp.url);
+  const qid = first(sp.qid);
+  const entity_id = first(sp.entity_id);
+  const entity_type = first(sp.entity_type);
+  const rankRaw = first(sp.rank);
 
-  const qid = (sp.qid || "").trim() || null;
-  const entity_id = (sp.entity_id || "").trim() || null;
-  const entity_type = (sp.entity_type || "").trim() || null;
+  const city_id = first(sp.city_id) || null;
+  const context_url = first(sp.context_url) || null;
 
-  const rank = sp.rank ? Number(sp.rank) : null;
-  const city_id = (sp.city_id || "").trim() || null;
-  const context_url = (sp.context_url || "").trim() || null;
+  if (!url) {
+    return (
+      <main style={{ padding: 24 }}>
+        <h1>Invalid redirect</h1>
+        <p>Missing url param.</p>
+      </main>
+    );
+  }
 
-  const apiBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE);
-
-  await postJson(`${apiBase}/events/click`, {
-    query_id: qid,
-    entity_id,
-    entity_type,
-    rank,
+  const payload: Record<string, any> = {
+    query_id: qid || null,
+    entity_id: entity_id || null,
+    entity_type: entity_type || null,
+    rank: rankRaw ? Number(rankRaw) : null,
     url,
     city_id,
     context_url,
     timestamp: new Date().toISOString(),
-  });
+  };
 
+  await postClick(payload);
+
+  // internal navigation (e.g. /pune/baner)
   redirect(url);
 }
