@@ -13,6 +13,8 @@ from elasticsearch import Elasticsearch
 from fastapi import APIRouter, Body, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from urllib.parse import urlparse, unquote
+import re
 
 # -----------------------
 # Config
@@ -165,6 +167,93 @@ def money_to_rupees(num: float, unit: str) -> int:
         return int(num * 10_000_000)
     return int(num)
 
+URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+def extract_clean_path(raw_q: str) -> str | None:
+    """
+    Detect if query is a URL or slug-like path and extract a clean path that can match canonical_url in ES.
+    Examples:
+      - "https://example.com/pune/baner?x=1" -> "/pune/baner"
+      - "/pune/baner/" -> "/pune/baner"
+      - "pune/baner" -> "/pune/baner"
+    Returns None if it doesn't look like a path/URL.
+    """
+    if not raw_q:
+        return None
+
+    q = raw_q.strip()
+    if not q:
+        return None
+
+    # If it's a full URL, parse it and take the path
+    if URL_SCHEME_RE.match(q):
+        try:
+            parsed = urlparse(q)
+            path = parsed.path or ""
+        except Exception:
+            return None
+    else:
+        # If it contains spaces, it's not a clean URL/slug
+        if " " in q:
+            return None
+
+        # If it starts with "/", treat as a path
+        if q.startswith("/"):
+            path = q
+        else:
+            # slug-like: must contain "/" to be considered a path candidate
+            if "/" not in q:
+                return None
+            path = "/" + q
+
+    # Decode URL-encoded chars and strip query/hash fragments if any leaked in
+    path = unquote(path)
+    path = path.split("?", 1)[0].split("#", 1)[0].strip()
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # Normalize trailing slash (except root)
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+
+    # Avoid treating "/search" itself as a canonical entity (optional guard)
+    if path in ("/search", "/disambiguate", "/go"):
+        return None
+
+    return path or None
+
+
+def es_lookup_by_canonical_url(path: str):
+    """
+    Exact lookup in ES using canonical_url.
+    Returns EntityOut (via hit_to_entity) or None.
+    """
+    if not path:
+        return None
+
+    body = {
+        "size": 1,
+        "query": {
+            "bool": {
+                "should": [
+                    {"term": {"canonical_url": path}},
+                    # in case mapping uses keyword subfield in your index
+                    {"term": {"canonical_url.keyword": path}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+    try:
+        res = es.search(index=INDEX_NAME, body=body)
+        hits = (res.get("hits") or {}).get("hits") or []
+        if not hits:
+            return None
+        return hit_to_entity(hits[0])
+    except Exception:
+        return None
 
 def parse_query(q: str) -> ParseResponse:
     s = normalize_q(q)
@@ -386,11 +475,30 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(q: str, city_id: Optional[str]) -> str:
-    url = f"/search?q={quote_plus(q)}"
+def build_serp_url(
+    q: str,
+    city_id: str | None = None,
+    qid: str | None = None,
+    context_url: str | None = None,
+) -> str:
+    """
+    Build a frontend SERP URL.
+    Supports optional tracking params (qid/context_url) used by newer resolve() logic.
+    """
+
+    # Local import to avoid messing with your top-of-file imports if they differ.
+    from urllib.parse import urlencode, quote_plus
+
+    params: dict[str, str] = {"q": q}
+
     if city_id:
-        url += f"&city_id={quote_plus(city_id)}"
-    return url
+        params["city_id"] = city_id
+    if qid:
+        params["qid"] = qid
+    if context_url:
+        params["context_url"] = context_url
+
+    return "/search?" + urlencode(params, quote_via=quote_plus)
 
 
 # -----------------------
@@ -542,22 +650,131 @@ def zero_state(
 
 
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(
-    q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-):
-    nq = normalize_q(q)
+def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = None):
+    raw_q = q or ""
+    nq = normalize_q(raw_q)
 
-    # 1) constraints -> SERP (always return url)
-    if is_constraint_heavy(q):
+    # 0) Long-tail / clean URL resolution (NEW)
+    clean_path = extract_clean_path(raw_q)
+    if clean_path:
+        url_match = es_lookup_by_canonical_url(clean_path)
+        if url_match:
+            return ResolveResponse(
+                action="redirect",
+                query=raw_q,
+                normalized_query=nq,
+                url=url_match.canonical_url,
+                match=url_match,
+                candidates=None,
+                reason="clean_url",
+                debug={"clean_path": clean_path},
+            )
+
+    # 1) Constraint-heavy queries → SERP
+    if is_constraint_heavy(raw_q):
         return ResolveResponse(
             action="serp",
-            query=q,
+            query=raw_q,
             normalized_query=nq,
-            url=build_serp_url(q, city_id),
+            url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
+            match=None,
+            candidates=None,
             reason="constraint_heavy",
+            debug=None,
         )
 
+    # 2) Retrieve candidates
+    hits, _dym = es_search_entities(q=raw_q, limit=10, city_id=city_id)
+    if not hits:
+        return ResolveResponse(
+            action="serp",
+            query=raw_q,
+            normalized_query=nq,
+            url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
+            match=None,
+            candidates=None,
+            reason="no_results",
+            debug=None,
+        )
+
+    entities = [hit_to_entity(h) for h in hits]
+
+    # 3) Same-name disambiguation detection (exact name matches)
+    exact_matches = [
+        e for e in entities
+        if normalize_q(e.name) == nq and e.city_id is not None
+    ]
+
+    # If we have multiple exact matches across different cities, disambiguate
+    if len(exact_matches) >= 2:
+        # City-scoped shortcut: if city_id provided and there is exactly one match for that city → redirect
+        if city_id:
+            scoped = [e for e in exact_matches if e.city_id == city_id]
+            if len(scoped) == 1:
+                return ResolveResponse(
+                    action="redirect",
+                    query=raw_q,
+                    normalized_query=nq,
+                    url=scoped[0].canonical_url,
+                    match=scoped[0],
+                    candidates=None,
+                    reason="city_scoped_same_name",
+                    debug={"city_id": city_id, "candidate_count": len(exact_matches)},
+                )
+
+        # Otherwise disambiguate (sorted by popularity)
+        exact_matches_sorted = sorted(
+            exact_matches,
+            key=lambda x: float(x.popularity_score or 0.0),
+            reverse=True,
+        )
+        return ResolveResponse(
+            action="disambiguate",
+            query=raw_q,
+            normalized_query=nq,
+            url=None,
+            match=None,
+            candidates=exact_matches_sorted,
+            reason="same_name",
+            debug={
+                "candidate_count": len(exact_matches_sorted),
+                "cities": sorted({(e.city_id or "") for e in exact_matches_sorted}),
+            },
+        )
+
+    # 4) Confidence-based redirect vs SERP
+    top = hits[0]
+    second = hits[1] if len(hits) > 1 else None
+    top_score = float(top.get("_score") or 0.0)
+    second_score = float(second.get("_score") or 0.0) if second else 0.0
+    gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
+
+    match = hit_to_entity(top)
+
+    # Tune-able thresholds (keep aligned with your existing behavior)
+    if top_score >= 5.0 and gap >= 0.30:
+        return ResolveResponse(
+            action="redirect",
+            query=raw_q,
+            normalized_query=nq,
+            url=match.canonical_url,
+            match=match,
+            candidates=None,
+            reason="confident_top_hit",
+            debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+        )
+
+    return ResolveResponse(
+        action="serp",
+        query=raw_q,
+        normalized_query=nq,
+        url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
+        match=None,
+        candidates=None,
+        reason="ambiguous",
+        debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+    )
+    
     # 2) GLOBAL lookup first to detect same-name collisions across cities
     global_hits, _ = es_search_entities(q=q, limit=10, city_id=None)
     if not global_hits:
