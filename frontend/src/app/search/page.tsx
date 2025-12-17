@@ -15,11 +15,9 @@ function enc(v: string): string {
 }
 
 function makeQid(): string {
-  // Node/Edge safe in Next server components
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const g: any = globalThis as any;
   if (g?.crypto?.randomUUID) return g.crypto.randomUUID();
-  // fallback (rare)
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
@@ -54,6 +52,21 @@ function flattenGroups(groups: SuggestResponse["groups"]): EntityOut[] {
   (groups.rate_pages || []).forEach((x) => out.push(x));
   (groups.property_pdps || []).forEach((x) => out.push(x));
   return out;
+}
+
+function buildSerpHref(args: {
+  q: string;
+  qid: string;
+  city_id?: string;
+  context_url?: string;
+}) {
+  const { q, qid, city_id, context_url } = args;
+  const qp: string[] = [];
+  qp.push(`q=${enc(q)}`);
+  qp.push(`qid=${enc(qid)}`);
+  if (city_id) qp.push(`city_id=${enc(city_id)}`);
+  if (context_url) qp.push(`context_url=${enc(context_url)}`);
+  return `/search?${qp.join("&")}`;
 }
 
 export default async function SearchPage({
@@ -91,6 +104,12 @@ export default async function SearchPage({
   const all = flattenGroups(data.groups);
   const hasAny = all.length > 0;
 
+  const dym =
+    (data.did_you_mean || "").trim() &&
+    data.did_you_mean!.trim().toLowerCase() !== q.toLowerCase()
+      ? data.did_you_mean!.trim()
+      : null;
+
   return (
     <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px" }}>
       <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
@@ -99,6 +118,26 @@ export default async function SearchPage({
         </h1>
         <span style={{ opacity: 0.7, fontSize: 13 }}>qid: {qid}</span>
       </div>
+
+      {dym ? (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            border: "1px solid #eee",
+            borderRadius: 8,
+          }}
+        >
+          <span style={{ opacity: 0.85 }}>Did you mean </span>
+          <Link
+            href={buildSerpHref({ q: dym, qid, city_id, context_url })}
+            style={{ fontWeight: 700, textDecoration: "none" }}
+          >
+            {dym}
+          </Link>
+          <span style={{ opacity: 0.85 }}>?</span>
+        </div>
+      ) : null}
 
       {!hasAny ? (
         <>
