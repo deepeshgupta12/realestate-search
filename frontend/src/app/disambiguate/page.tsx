@@ -1,4 +1,3 @@
-// frontend/src/app/disambiguate/page.tsx
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -9,9 +8,9 @@ type EntityOut = {
   id: string;
   entity_type: string;
   name: string;
-  city: string;
-  city_id: string;
-  parent_name?: string;
+  city?: string | null;
+  city_id?: string | null;
+  parent_name?: string | null;
   canonical_url: string;
   score?: number | null;
   popularity_score?: number | null;
@@ -22,158 +21,127 @@ type ResolveResponse = {
   query: string;
   normalized_query: string;
   url: string | null;
-  match: EntityOut | null;
-  candidates: EntityOut[] | null;
-  reason: string | null;
-  debug: any | null;
+  candidates?: EntityOut[] | null;
+  reason?: string | null;
+  debug?: any;
 };
+
+function sp1(v: string | null): string {
+  return v ?? "";
+}
+
+function ensureLeadingSlash(u: string): string {
+  if (!u) return "/";
+  return u.startsWith("/") ? u : `/${u}`;
+}
 
 export default function DisambiguatePage() {
   const router = useRouter();
   const sp = useSearchParams();
 
-  const q = sp.get("q") || "";
-  const qid = sp.get("qid") || ""; // for click attribution
-  const city_id = sp.get("city_id") || "";
-  const context_url = sp.get("context_url") || "/";
+  const q = sp1(sp.get("q"));
+  const qid = sp1(sp.get("qid"));
+  const city_id_param = sp1(sp.get("city_id")) || null;
+  const context_url = sp1(sp.get("context_url")) || "/";
 
   const [loading, setLoading] = useState(true);
   const [candidates, setCandidates] = useState<EntityOut[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
   const title = useMemo(() => {
-    const cleaned = q.trim();
-    return cleaned ? `Which "${cleaned}" did you mean?` : "Choose one";
+    if (!q) return "Choose one";
+    return `Which “${q}” did you mean?`;
   }, [q]);
 
   useEffect(() => {
-    let alive = true;
-
     async function run() {
       setLoading(true);
-      setError(null);
-
+      setErr(null);
       try {
-        const resp = await apiGet<ResolveResponse>("/search/resolve", {
-          q,
-          city_id: city_id || undefined,
-          context_url: context_url || undefined,
-        });
+        const path =
+          `/search/resolve?q=${encodeURIComponent(q)}` +
+          (city_id_param ? `&city_id=${encodeURIComponent(city_id_param)}` : "") +
+          `&context_url=${encodeURIComponent(context_url)}`;
+        const res = await apiGet<ResolveResponse>(path);
 
-        if (!alive) return;
-
-        if (resp.action === "redirect" && resp.url) {
-          router.replace(resp.url);
+        if (res.action === "redirect" && res.url) {
+          router.replace(ensureLeadingSlash(res.url));
           return;
         }
 
-        if (resp.action === "serp") {
-          router.replace(resp.url || `/search?q=${encodeURIComponent(q)}`);
-          return;
-        }
-
-        setCandidates(resp.candidates || []);
+        setCandidates(res.candidates || []);
       } catch (e: any) {
-        if (!alive) return;
-        setError(e?.message || "Failed to load disambiguation candidates");
+        setErr(e?.message || "Failed to load disambiguation options");
       } finally {
-        if (!alive) return;
         setLoading(false);
       }
     }
 
-    run();
-    return () => {
-      alive = false;
-    };
-  }, [q, city_id, context_url, router]);
-
-  async function onPick(item: EntityOut, rank: number) {
-    // Log click best-effort, then navigate.
-    try {
-      if (qid) {
-        await apiPost<{ ok: boolean }>("/events/click", {
-          query_id: qid,
-          entity_id: item.id,
-          entity_type: item.entity_type,
-          rank,
-          url: item.canonical_url,
-          city_id: city_id || null,
-          context_url: context_url || null,
-          timestamp: new Date().toISOString(),
-        });
-      }
-    } catch {
-      // ignore logging failures
-    } finally {
-      router.push(item.canonical_url);
+    if (!q) {
+      setLoading(false);
+      setCandidates([]);
+      return;
     }
+
+    run();
+  }, [q, city_id_param, context_url, router]);
+
+  async function onPick(it: EntityOut, idx: number) {
+    // CLICK LOG MUST include city_id: prefer entity city_id > page city_id
+    const city_id = (it.city_id || city_id_param || null) as string | null;
+
+    if (qid) {
+      await apiPost("/events/click", {
+        query_id: qid,
+        entity_id: it.id,
+        entity_type: it.entity_type,
+        rank: idx + 1,
+        url: ensureLeadingSlash(it.canonical_url),
+        city_id,
+        context_url,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    router.push(ensureLeadingSlash(it.canonical_url));
   }
 
   return (
-    <div style={{ maxWidth: 860, margin: "24px auto", padding: "0 16px" }}>
-      <h1 style={{ fontSize: 22, marginBottom: 8 }}>{title}</h1>
-      <p style={{ marginTop: 0, opacity: 0.8 }}>
-        Select the correct place to continue.
+    <div className="mx-auto max-w-2xl px-4 py-10">
+      <h1 className="text-xl font-semibold">{title}</h1>
+      <p className="mt-1 text-sm text-gray-600">
+        Select the correct location/project to continue.
       </p>
 
-      {loading && <div>Loading…</div>}
+      {loading && <div className="mt-6 text-sm text-gray-600">Loading…</div>}
 
-      {!loading && error && (
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <div style={{ marginBottom: 8, fontWeight: 600 }}>Error</div>
-          <div style={{ whiteSpace: "pre-wrap" }}>{error}</div>
-          <div style={{ marginTop: 12 }}>
-            <button onClick={() => router.push(`/search?q=${encodeURIComponent(q)}`)}>
-              Go to results
-            </button>
-          </div>
+      {!loading && err && (
+        <div className="mt-6 rounded-lg border bg-red-50 px-4 py-3 text-sm text-red-700">
+          {err}
         </div>
       )}
 
-      {!loading && !error && candidates.length === 0 && (
-        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <div style={{ marginBottom: 8, fontWeight: 600 }}>No candidates</div>
-          <div>We couldn’t find matching pages. Try the results page.</div>
-          <div style={{ marginTop: 12 }}>
-            <button onClick={() => router.push(`/search?q=${encodeURIComponent(q)}`)}>
-              Go to results
-            </button>
-          </div>
+      {!loading && !err && candidates.length === 0 && (
+        <div className="mt-6 rounded-lg border bg-gray-50 px-4 py-3 text-sm text-gray-700">
+          No disambiguation options found. Try searching again.
         </div>
       )}
 
-      {!loading && !error && candidates.length > 0 && (
-        <div style={{ marginTop: 12 }}>
-          {candidates.map((c, idx) => (
+      {!loading && !err && candidates.length > 0 && (
+        <div className="mt-6 space-y-2">
+          {candidates.map((it, idx) => (
             <button
-              key={c.id}
-              onClick={() => onPick(c, idx + 1)}
-              style={{
-                display: "block",
-                width: "100%",
-                textAlign: "left",
-                padding: "12px 14px",
-                marginBottom: 10,
-                border: "1px solid #e5e5e5",
-                borderRadius: 10,
-                background: "white",
-                cursor: "pointer",
-              }}
+              key={`${it.id}_${idx}`}
+              onClick={() => void onPick(it, idx)}
+              className="w-full rounded-xl border px-4 py-3 text-left hover:bg-gray-50"
+              type="button"
             >
-              <div style={{ fontWeight: 700 }}>
-                {c.name}{" "}
-                <span style={{ fontWeight: 500, opacity: 0.7 }}>
-                  ({c.entity_type})
-                </span>
+              <div className="font-medium">{it.name}</div>
+              <div className="mt-0.5 text-xs text-gray-600">
+                {it.city ? it.city : "—"}
+                {it.parent_name ? ` • ${it.parent_name}` : ""}
               </div>
-              <div style={{ opacity: 0.85, marginTop: 4 }}>
-                {c.city ? `${c.city}` : ""}{" "}
-                {c.parent_name ? `• ${c.parent_name}` : ""}
-              </div>
-              <div style={{ opacity: 0.6, marginTop: 4, fontSize: 12 }}>
-                {c.canonical_url}
-              </div>
+              <div className="mt-1 text-xs text-gray-400">{it.canonical_url}</div>
             </button>
           ))}
         </div>

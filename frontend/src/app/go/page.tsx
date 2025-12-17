@@ -1,6 +1,5 @@
-// frontend/src/app/go/page.tsx
 import { redirect } from "next/navigation";
-import { buildUrl } from "@/lib/api";
+import { apiGet, apiPost } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
@@ -9,69 +8,118 @@ type ResolveResponse = {
   query: string;
   normalized_query: string;
   url: string | null;
-  match: any | null;
-  candidates: any[] | null;
-  reason: string | null;
-  debug: any | null;
+  match?: any | null;
+  candidates?: any[] | null;
+  reason?: string | null;
 };
 
-type SP = Record<string, string | string[] | undefined>;
-
-type PageProps = {
-  // In some Next versions this is an object, in others it can be a Promise.
-  searchParams?: SP | Promise<SP>;
-};
-
-function sp1(v: string | string[] | undefined): string | undefined {
-  if (!v) return undefined;
-  return Array.isArray(v) ? v[0] : v;
+function sp1(v: string | string[] | undefined | null): string {
+  if (!v) return "";
+  return Array.isArray(v) ? (v[0] ?? "") : v;
 }
 
+function ensureLeadingSlash(u: string): string {
+  if (!u) return "/";
+  return u.startsWith("/") ? u : `/${u}`;
+}
+
+function appendParam(baseUrl: string, key: string, value: string): string {
+  if (!value) return baseUrl;
+  const hasQ = baseUrl.includes("?");
+  const sep = hasQ ? "&" : "?";
+  return `${baseUrl}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+function uuid(): string {
+  // Node 18+ supports crypto.randomUUID()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c: any = globalThis.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `qid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+type PageProps = {
+  // Next 15 can pass searchParams as Promise (sync-dynamic-apis)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  searchParams: any;
+};
+
 export default async function GoPage({ searchParams }: PageProps) {
-  // ✅ Works whether searchParams is an object or a Promise
-  const sp: SP = await Promise.resolve(searchParams ?? {});
+  const sp = await Promise.resolve(searchParams);
 
   const q = sp1(sp.q);
-  const city_id = sp1(sp.city_id);
-  const context_url = sp1(sp.context_url) || "/";
-  const qid = sp1(sp.qid);
+  const url = sp1(sp.url);
 
-  if (!q || !q.trim()) {
+  const from_q = sp1(sp.from_q);
+  const entity_id = sp1(sp.entity_id);
+  const entity_type = sp1(sp.entity_type);
+  const rankStr = sp1(sp.rank);
+
+  const city_id = sp1(sp.city_id) || null;
+  const context_url = sp1(sp.context_url) || "/";
+
+  // --- CLICK MODE: /go?url=/pune/baner&entity_id=...&entity_type=...&rank=1 ---
+  if (url) {
+    // Optional click logging (only if we have enough metadata)
+    if (entity_id && entity_type) {
+      const qid = sp1(sp.qid) || uuid();
+      const rank = rankStr ? Number(rankStr) : 1;
+
+      await apiPost("/events/click", {
+        query_id: qid,
+        entity_id,
+        entity_type,
+        rank: Number.isFinite(rank) ? rank : 1,
+        url: ensureLeadingSlash(url),
+        city_id,
+        context_url,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    redirect(ensureLeadingSlash(url));
+  }
+
+  // --- SEARCH MODE: /go?q=baner ---
+  if (!q) {
     redirect("/");
   }
 
-  const resolveUrl = buildUrl("/search/resolve", {
-    q,
-    city_id: city_id || undefined,
-    context_url: context_url || undefined,
+  const qid = uuid();
+
+  const resolvePath =
+    `/search/resolve?q=${encodeURIComponent(q)}` +
+    (city_id ? `&city_id=${encodeURIComponent(city_id)}` : "") +
+    `&context_url=${encodeURIComponent(context_url)}`;
+
+  const res = await apiGet<ResolveResponse>(resolvePath);
+
+  // log search (always)
+  await apiPost("/events/search", {
+    query_id: qid,
+    raw_query: q,
+    normalized_query: res?.normalized_query || q.trim().toLowerCase(),
+    city_id,
+    context_url,
+    timestamp: new Date().toISOString(),
   });
 
-  const res = await fetch(resolveUrl, { cache: "no-store" });
-  if (!res.ok) {
-    redirect(`/search?q=${encodeURIComponent(q)}`);
+  // Redirect decisions
+  if (res.action === "redirect" && res.url) {
+    redirect(ensureLeadingSlash(res.url));
   }
 
-  const data = (await res.json()) as ResolveResponse;
-
-  if (data.action === "redirect" && data.url) {
-    redirect(data.url);
+  if (res.action === "disambiguate") {
+    let target = `/disambiguate?q=${encodeURIComponent(q)}&qid=${encodeURIComponent(qid)}`;
+    if (city_id) target = appendParam(target, "city_id", city_id);
+    target = appendParam(target, "context_url", context_url);
+    redirect(target);
   }
 
-  if (data.action === "serp") {
-    if (data.url) redirect(data.url);
-    redirect(
-      `/search?q=${encodeURIComponent(q)}${
-        city_id ? `&city_id=${encodeURIComponent(city_id)}` : ""
-      }`
-    );
-  }
-
-  // disambiguate
-  const disUrl =
-    `/disambiguate?q=${encodeURIComponent(q)}` +
-    (qid ? `&qid=${encodeURIComponent(qid)}` : "") +
-    (city_id ? `&city_id=${encodeURIComponent(city_id)}` : "") +
-    (context_url ? `&context_url=${encodeURIComponent(context_url)}` : "");
-
-  redirect(disUrl);
+  // SERP fallback
+  let serp = res.url ? ensureLeadingSlash(res.url) : `/search?q=${encodeURIComponent(q)}`;
+  serp = appendParam(serp, "qid", qid);
+  if (city_id) serp = appendParam(serp, "city_id", city_id);
+  serp = appendParam(serp, "context_url", context_url);
+  redirect(serp);
 }

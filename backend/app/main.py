@@ -3,18 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from elasticsearch import Elasticsearch
-from fastapi import APIRouter, Body, FastAPI, Query
+from elasticsearch.exceptions import NotFoundError
+from fastapi import APIRouter, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from urllib.parse import urlparse, unquote
-import re
+
 
 # -----------------------
 # Config
@@ -24,8 +23,20 @@ ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 
 ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
-
 REQUEST_TIMEOUT = float(os.getenv("ES_REQUEST_TIMEOUT", "3.0"))
+
+# Local JSON redirects registry (optional)
+# Format: {"/old-path": "/new-path", ...}
+REDIRECTS_FILE = os.getenv("REDIRECTS_FILE", "backend/data/redirects.json")
+
+# Local event log folder (runtime; gitignored)
+EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "backend/.events"))
+SEARCH_EVENTS_FILE = EVENTS_DIR / "search.jsonl"
+CLICK_EVENTS_FILE = EVENTS_DIR / "click.jsonl"
+
+# Resolver thresholds (demo-tuned)
+MIN_REDIRECT_SCORE = float(os.getenv("MIN_REDIRECT_SCORE", "5.0"))
+MIN_REDIRECT_GAP = float(os.getenv("MIN_REDIRECT_GAP", "0.30"))
 
 
 def get_es() -> Elasticsearch:
@@ -36,7 +47,6 @@ def get_es() -> Elasticsearch:
     if ES_USERNAME and ES_PASSWORD:
         kwargs["basic_auth"] = (ES_USERNAME, ES_PASSWORD)
 
-    # local dev typically without TLS; keep warnings quiet if users enable TLS later
     kwargs["verify_certs"] = False
     kwargs["ssl_show_warn"] = False
     return Elasticsearch(**kwargs)
@@ -84,14 +94,6 @@ class TrendingResponse(BaseModel):
     items: List[EntityOut]
 
 
-class ZeroStateResponse(BaseModel):
-    city_id: Optional[str]
-    recent_searches: List[str]
-    trending_searches: List[EntityOut]
-    trending_localities: List[EntityOut]
-    popular_entities: List[EntityOut]
-
-
 class AdminOk(BaseModel):
     ok: bool
     message: Optional[str] = None
@@ -106,15 +108,18 @@ class ParseResponse(BaseModel):
     intent: Optional[str] = None  # buy | rent
     bhk: Optional[int] = None
     locality_hint: Optional[str] = None
-    max_price: Optional[int] = None  # rupees
-    max_rent: Optional[int] = None   # rupees/month
+    max_price: Optional[int] = None  # INR
+    max_rent: Optional[int] = None   # INR / month
     currency: str = "INR"
     ok: bool = True
 
 
-class EventOk(BaseModel):
-    ok: bool = True
-    query_id: Optional[str] = None
+class ZeroStateResponse(BaseModel):
+    city_id: Optional[str] = None
+    recent_searches: List[str] = Field(default_factory=list)
+    trending_searches: List[EntityOut] = Field(default_factory=list)
+    trending_localities: List[EntityOut] = Field(default_factory=list)
+    popular_entities: List[EntityOut] = Field(default_factory=list)
 
 
 class SearchEventIn(BaseModel):
@@ -137,6 +142,10 @@ class ClickEventIn(BaseModel):
     timestamp: str
 
 
+class EventOk(BaseModel):
+    ok: bool
+
+
 # -----------------------
 # Helpers
 # -----------------------
@@ -149,7 +158,7 @@ def is_constraint_heavy(q: str) -> bool:
     patterns = [
         r"\bunder\b", r"\bbelow\b", r"\bless than\b",
         r"\bbetween\b", r"\bto\b",
-        r"\bbhk\b", r"\b1bhk\b", r"\b2bhk\b", r"\b3bhk\b", r"\b4bhk\b", r"\b5bhk\b",
+        r"\bbhk\b", r"\b1bhk\b", r"\b2bhk\b", r"\b3bhk\b", r"\b4bhk\b", r"\b5bhk\b", r"\b6bhk\b",
         r"\brent\b", r"\brental\b",
         r"\bbuy\b", r"\bresale\b", r"\bsale\b",
         r"\b₹\b", r"\brs\b", r"\bl\b", r"\bcr\b", r"\bk\b",
@@ -167,93 +176,6 @@ def money_to_rupees(num: float, unit: str) -> int:
         return int(num * 10_000_000)
     return int(num)
 
-URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
-
-def extract_clean_path(raw_q: str) -> str | None:
-    """
-    Detect if query is a URL or slug-like path and extract a clean path that can match canonical_url in ES.
-    Examples:
-      - "https://example.com/pune/baner?x=1" -> "/pune/baner"
-      - "/pune/baner/" -> "/pune/baner"
-      - "pune/baner" -> "/pune/baner"
-    Returns None if it doesn't look like a path/URL.
-    """
-    if not raw_q:
-        return None
-
-    q = raw_q.strip()
-    if not q:
-        return None
-
-    # If it's a full URL, parse it and take the path
-    if URL_SCHEME_RE.match(q):
-        try:
-            parsed = urlparse(q)
-            path = parsed.path or ""
-        except Exception:
-            return None
-    else:
-        # If it contains spaces, it's not a clean URL/slug
-        if " " in q:
-            return None
-
-        # If it starts with "/", treat as a path
-        if q.startswith("/"):
-            path = q
-        else:
-            # slug-like: must contain "/" to be considered a path candidate
-            if "/" not in q:
-                return None
-            path = "/" + q
-
-    # Decode URL-encoded chars and strip query/hash fragments if any leaked in
-    path = unquote(path)
-    path = path.split("?", 1)[0].split("#", 1)[0].strip()
-
-    if not path.startswith("/"):
-        path = "/" + path
-
-    # Normalize trailing slash (except root)
-    if len(path) > 1 and path.endswith("/"):
-        path = path[:-1]
-
-    # Avoid treating "/search" itself as a canonical entity (optional guard)
-    if path in ("/search", "/disambiguate", "/go"):
-        return None
-
-    return path or None
-
-
-def es_lookup_by_canonical_url(path: str):
-    """
-    Exact lookup in ES using canonical_url.
-    Returns EntityOut (via hit_to_entity) or None.
-    """
-    if not path:
-        return None
-
-    body = {
-        "size": 1,
-        "query": {
-            "bool": {
-                "should": [
-                    {"term": {"canonical_url": path}},
-                    # in case mapping uses keyword subfield in your index
-                    {"term": {"canonical_url.keyword": path}},
-                ],
-                "minimum_should_match": 1,
-            }
-        },
-    }
-
-    try:
-        res = es.search(index=INDEX_NAME, body=body)
-        hits = (res.get("hits") or {}).get("hits") or []
-        if not hits:
-            return None
-        return hit_to_entity(hits[0])
-    except Exception:
-        return None
 
 def parse_query(q: str) -> ParseResponse:
     s = normalize_q(q)
@@ -276,7 +198,6 @@ def parse_query(q: str) -> ParseResponse:
 
     max_price = None
     max_rent = None
-
     m = re.search(r"\bunder\s+([0-9]+(?:\.[0-9]+)?)\s*(cr|crore|l|lac|lakh|k)\b", s)
     if m:
         value = float(m.group(1))
@@ -296,6 +217,112 @@ def parse_query(q: str) -> ParseResponse:
         max_rent=max_rent,
         ok=True,
     )
+
+
+def ensure_events_dir() -> None:
+    EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    ensure_events_dir()
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def build_serp_url(
+    q: str,
+    city_id: Optional[str] = None,
+    qid: Optional[str] = None,
+    context_url: Optional[str] = None,
+) -> str:
+    base = f"/search?q={quote_plus(q)}"
+    if city_id:
+        base += f"&city_id={quote_plus(city_id)}"
+    if qid:
+        base += f"&qid={quote_plus(qid)}"
+    if context_url:
+        base += f"&context_url={quote_plus(context_url)}"
+    return base
+
+
+def build_disambiguate_url(
+    q: str,
+    qid: Optional[str] = None,
+    city_id: Optional[str] = None,
+    context_url: Optional[str] = None,
+) -> str:
+    base = f"/disambiguate?q={quote_plus(q)}"
+    if qid:
+        base += f"&qid={quote_plus(qid)}"
+    if city_id:
+        base += f"&city_id={quote_plus(city_id)}"
+    if context_url:
+        base += f"&context_url={quote_plus(context_url)}"
+    return base
+
+
+def clean_path_from_anything(q: str) -> Optional[str]:
+    """
+    Accept:
+      - "/pune/baner"
+      - "pune/baner"
+      - "https://example.com/pune/baner?utm=1"
+    Return normalized path: "/pune/baner" (no query/fragment)
+    """
+    raw = q.strip()
+    if not raw:
+        return None
+
+    # Full URL
+    if re.match(r"^https?://", raw, re.I):
+        u = urlparse(raw)
+        path = u.path or ""
+    else:
+        # slug/path-ish
+        path = raw
+
+    if not path:
+        return None
+
+    # strip query-ish if user pasted "pune/baner?x=1"
+    path = path.split("?", 1)[0].split("#", 1)[0].strip()
+
+    if not path:
+        return None
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # normalize multiple slashes, trim trailing slash (except root)
+    path = re.sub(r"/{2,}", "/", path)
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+
+    return path
+
+
+def load_redirect_registry() -> Dict[str, str]:
+    p = Path(REDIRECTS_FILE)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            # normalize keys/values
+            out: Dict[str, str] = {}
+            for k, v in data.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    continue
+                ck = clean_path_from_anything(k) or k
+                cv = clean_path_from_anything(v) or v
+                out[ck] = cv
+            return out
+    except Exception:
+        return {}
+    return {}
+
+
+REDIRECTS: Dict[str, str] = load_redirect_registry()
 
 
 def build_mapping() -> Dict[str, Any]:
@@ -409,6 +436,21 @@ def es_search_entities(q: str, limit: int, city_id: Optional[str]) -> Tuple[List
     return hits, sugg
 
 
+def es_lookup_by_canonical_url(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = es.search(
+            index=INDEX_NAME,
+            body={
+                "size": 1,
+                "query": {"term": {"canonical_url": path}},
+            },
+        )
+        hits = res.get("hits", {}).get("hits", [])
+        return hits[0] if hits else None
+    except Exception:
+        return None
+
+
 def hit_to_entity(hit: Dict[str, Any], for_trending: bool = False) -> EntityOut:
     src = hit.get("_source", {})
     score = hit.get("_score")
@@ -475,42 +517,35 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     return [hit_to_entity(h, for_trending=True) for h in hits]
 
 
-def build_serp_url(
-    q: str,
-    city_id: str | None = None,
-    qid: str | None = None,
-    context_url: str | None = None,
-) -> str:
+def filter_trending_localities(items: List[EntityOut]) -> List[EntityOut]:
+    out: List[EntityOut] = []
+    for it in items:
+        if it.entity_type in ("city", "micromarket", "locality"):
+            out.append(it)
+    # keep small + stable
+    return out[:4]
+
+
+def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
     """
-    Build a frontend SERP URL.
-    Supports optional tracking params (qid/context_url) used by newer resolve() logic.
+    V1 MVP: add constraints as query params to the location canonical url.
+    Later we can map to true SY DSE filter syntax.
     """
+    base = entity.canonical_url
+    params: List[str] = []
 
-    # Local import to avoid messing with your top-of-file imports if they differ.
-    from urllib.parse import urlencode, quote_plus
+    if parsed.intent:
+        params.append(f"intent={quote_plus(parsed.intent)}")
+    if parsed.bhk is not None:
+        params.append(f"bhk={parsed.bhk}")
+    if parsed.max_price is not None:
+        params.append(f"max_price={parsed.max_price}")
+    if parsed.max_rent is not None:
+        params.append(f"max_rent={parsed.max_rent}")
 
-    params: dict[str, str] = {"q": q}
-
-    if city_id:
-        params["city_id"] = city_id
-    if qid:
-        params["qid"] = qid
-    if context_url:
-        params["context_url"] = context_url
-
-    return "/search?" + urlencode(params, quote_via=quote_plus)
-
-
-# -----------------------
-# Event logging (local dev)
-# -----------------------
-EVENTS_DIR = (Path(__file__).resolve().parents[1] / ".events")  # backend/.events
-
-
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    if not params:
+        return base
+    return base + ("?" + "&".join(params))
 
 
 # -----------------------
@@ -528,7 +563,6 @@ app.add_middleware(
 
 admin = APIRouter()
 search = APIRouter()
-events = APIRouter()
 
 
 @app.get("/health")
@@ -536,9 +570,6 @@ def health():
     return {"status": "ok"}
 
 
-# -----------------------
-# Admin
-# -----------------------
 @admin.get("/ping-es", response_model=AdminOk)
 def ping_es():
     info = es.info()
@@ -571,9 +602,6 @@ def seed():
     return AdminOk(ok=True, seeded=len(docs), index_count=int(count))
 
 
-# -----------------------
-# Search
-# -----------------------
 @search.get("", response_model=SuggestResponse)
 def search_serp(
     q: str = Query(..., min_length=1),
@@ -638,229 +666,189 @@ def zero_state(
     limit: int = 8,
 ):
     trending = fetch_trending(city_id=city_id, limit=limit)
-    loc_pool = fetch_trending(city_id=city_id, limit=max(limit * 2, 10))
-    trending_localities = [e for e in loc_pool if e.entity_type in ("city", "locality", "micromarket")][: max(2, limit // 2)]
     return ZeroStateResponse(
         city_id=city_id,
         recent_searches=[],
         trending_searches=trending,
-        trending_localities=trending_localities,
+        trending_localities=filter_trending_localities(trending),
         popular_entities=trending,
     )
 
 
 @search.get("/resolve", response_model=ResolveResponse)
-def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = None):
-    raw_q = q or ""
-    nq = normalize_q(raw_q)
+def resolve(
+    q: str = Query(..., min_length=1),
+    city_id: Optional[str] = None,
+    context_url: Optional[str] = None,
+):
+    raw_q = q
 
-    # 0) Long-tail / clean URL resolution (NEW)
-    clean_path = extract_clean_path(raw_q)
-    if clean_path:
-        url_match = es_lookup_by_canonical_url(clean_path)
-        if url_match:
+    # 2.6A: clean URL / slug / full URL resolution
+    clean_path = clean_path_from_anything(raw_q)
+    if clean_path and ("/" in clean_path):
+        # 2.6B: redirect registry first (optional)
+        if clean_path in REDIRECTS:
+            target = REDIRECTS[clean_path]
             return ResolveResponse(
                 action="redirect",
                 query=raw_q,
-                normalized_query=nq,
-                url=url_match.canonical_url,
-                match=url_match,
-                candidates=None,
+                normalized_query=raw_q,
+                url=target,
+                reason="redirect_registry",
+                debug={"clean_path": clean_path, "target": target},
+            )
+
+        # direct canonical lookup
+        hit = es_lookup_by_canonical_url(clean_path)
+        if hit:
+            ent = hit_to_entity(hit)
+            return ResolveResponse(
+                action="redirect",
+                query=raw_q,
+                normalized_query=raw_q,
+                url=ent.canonical_url,
+                match=ent,
                 reason="clean_url",
                 debug={"clean_path": clean_path},
             )
+        # If looks like a path but not found: fall through to normal resolver (SERP/no_results)
 
-    # 1) Constraint-heavy queries → SERP
+    # 2.7A: constraint-heavy → try DSE-style redirect if we can extract a location confidently
     if is_constraint_heavy(raw_q):
+        parsed = parse_query(raw_q)
+
+        # If we can detect "in <locality>" use that as the candidate query.
+        if parsed.locality_hint:
+            hits, _ = es_search_entities(q=parsed.locality_hint, limit=10, city_id=city_id)
+
+            entities = [hit_to_entity(h) for h in hits]
+            # Restrict to locations only
+            locs = [e for e in entities if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview")]
+
+            # If multiple same-name locations across cities and city_id not provided -> disambiguate
+            if locs:
+                # Detect same-name multi-city ambiguity
+                by_name: Dict[str, List[EntityOut]] = {}
+                for e in locs:
+                    k = normalize_q(e.name)
+                    by_name.setdefault(k, []).append(e)
+                # Pick the group that matches the locality hint best (exact normalized)
+                key = normalize_q(parsed.locality_hint)
+                candidates = by_name.get(key, locs)
+
+                cities = sorted({c.city_id for c in candidates if c.city_id})
+                if len(candidates) > 1 and len(cities) > 1 and not city_id:
+                    return ResolveResponse(
+                        action="disambiguate",
+                        query=raw_q,
+                        normalized_query=normalize_q(raw_q),
+                        candidates=candidates[:10],
+                        reason="constraint_heavy_same_name",
+                        debug={"candidate_count": len(candidates), "cities": cities},
+                    )
+
+                # If city-scoped, choose the best match within city
+                if city_id:
+                    scoped = [c for c in candidates if c.city_id == city_id]
+                    if len(scoped) == 1:
+                        listing_url = build_listing_url(scoped[0], parsed)
+                        return ResolveResponse(
+                            action="redirect",
+                            query=raw_q,
+                            normalized_query=normalize_q(raw_q),
+                            url=listing_url,
+                            match=scoped[0],
+                            reason="constraint_heavy_city_scoped_listing",
+                            debug={"city_id": city_id, "base": scoped[0].canonical_url},
+                        )
+
+                # Otherwise if only one candidate overall -> redirect to listing URL
+                if len(candidates) == 1:
+                    listing_url = build_listing_url(candidates[0], parsed)
+                    return ResolveResponse(
+                        action="redirect",
+                        query=raw_q,
+                        normalized_query=normalize_q(raw_q),
+                        url=listing_url,
+                        match=candidates[0],
+                        reason="constraint_heavy_listing",
+                        debug={"base": candidates[0].canonical_url},
+                    )
+
+        # fallback (existing behavior): send to SERP
         return ResolveResponse(
             action="serp",
             query=raw_q,
-            normalized_query=nq,
+            normalized_query=raw_q,
             url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
-            match=None,
-            candidates=None,
             reason="constraint_heavy",
-            debug=None,
         )
 
-    # 2) Retrieve candidates
-    hits, _dym = es_search_entities(q=raw_q, limit=10, city_id=city_id)
+    # Normal resolver (no constraints)
+    hits, _ = es_search_entities(q=raw_q, limit=10, city_id=city_id)
     if not hits:
         return ResolveResponse(
             action="serp",
             query=raw_q,
-            normalized_query=nq,
+            normalized_query=raw_q,
             url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
-            match=None,
-            candidates=None,
             reason="no_results",
-            debug=None,
         )
 
     entities = [hit_to_entity(h) for h in hits]
 
-    # 3) Same-name disambiguation detection (exact name matches)
-    exact_matches = [
-        e for e in entities
-        if normalize_q(e.name) == nq and e.city_id is not None
-    ]
+    # same-name disambiguation (2.4A/2.4C)
+    top = entities[0]
+    same_name = [e for e in entities if normalize_q(e.name) == normalize_q(top.name) and e.entity_type == top.entity_type]
+    cities = sorted({e.city_id for e in same_name if e.city_id})
 
-    # If we have multiple exact matches across different cities, disambiguate
-    if len(exact_matches) >= 2:
-        # City-scoped shortcut: if city_id provided and there is exactly one match for that city → redirect
+    if len(same_name) > 1 and len(cities) > 1:
         if city_id:
-            scoped = [e for e in exact_matches if e.city_id == city_id]
+            scoped = [e for e in same_name if e.city_id == city_id]
             if len(scoped) == 1:
                 return ResolveResponse(
                     action="redirect",
                     query=raw_q,
-                    normalized_query=nq,
+                    normalized_query=normalize_q(raw_q),
                     url=scoped[0].canonical_url,
                     match=scoped[0],
-                    candidates=None,
                     reason="city_scoped_same_name",
-                    debug={"city_id": city_id, "candidate_count": len(exact_matches)},
+                    debug={"city_id": city_id, "candidate_count": len(same_name)},
                 )
 
-        # Otherwise disambiguate (sorted by popularity)
-        exact_matches_sorted = sorted(
-            exact_matches,
-            key=lambda x: float(x.popularity_score or 0.0),
-            reverse=True,
-        )
         return ResolveResponse(
             action="disambiguate",
             query=raw_q,
-            normalized_query=nq,
-            url=None,
-            match=None,
-            candidates=exact_matches_sorted,
+            normalized_query=normalize_q(raw_q),
+            candidates=same_name[:10],
             reason="same_name",
-            debug={
-                "candidate_count": len(exact_matches_sorted),
-                "cities": sorted({(e.city_id or "") for e in exact_matches_sorted}),
-            },
+            debug={"candidate_count": len(same_name), "cities": cities},
         )
 
-    # 4) Confidence-based redirect vs SERP
-    top = hits[0]
-    second = hits[1] if len(hits) > 1 else None
-    top_score = float(top.get("_score") or 0.0)
-    second_score = float(second.get("_score") or 0.0) if second else 0.0
+    # score-gap heuristic
+    top_hit = hits[0]
+    second_hit = hits[1] if len(hits) > 1 else None
+    top_score = float(top_hit.get("_score") or 0.0)
+    second_score = float(second_hit.get("_score") or 0.0) if second_hit else 0.0
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
 
-    match = hit_to_entity(top)
-
-    # Tune-able thresholds (keep aligned with your existing behavior)
-    if top_score >= 5.0 and gap >= 0.30:
+    match = hit_to_entity(top_hit)
+    if top_score >= MIN_REDIRECT_SCORE and gap >= MIN_REDIRECT_GAP:
         return ResolveResponse(
             action="redirect",
             query=raw_q,
-            normalized_query=nq,
+            normalized_query=normalize_q(raw_q),
             url=match.canonical_url,
             match=match,
-            candidates=None,
-            reason="confident_top_hit",
+            reason="confident_redirect",
             debug={"top_score": top_score, "second_score": second_score, "gap": gap},
         )
 
     return ResolveResponse(
         action="serp",
         query=raw_q,
-        normalized_query=nq,
+        normalized_query=normalize_q(raw_q),
         url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
-        match=None,
-        candidates=None,
-        reason="ambiguous",
-        debug={"top_score": top_score, "second_score": second_score, "gap": gap},
-    )
-    
-    # 2) GLOBAL lookup first to detect same-name collisions across cities
-    global_hits, _ = es_search_entities(q=q, limit=10, city_id=None)
-    if not global_hits:
-        return ResolveResponse(
-            action="serp",
-            query=q,
-            normalized_query=nq,
-            url=build_serp_url(q, city_id),
-            reason="no_results",
-        )
-
-    # candidates where name_norm == query norm (strong signal for “same-name”)
-    same_name_hits: List[Dict[str, Any]] = []
-    for h in global_hits:
-        src = h.get("_source", {}) or {}
-        name_norm = (src.get("name_norm") or "").strip().lower()
-        if not name_norm:
-            name_norm = normalize_q(str(src.get("name") or ""))
-        if name_norm == nq:
-            same_name_hits.append(h)
-
-    same_name_candidates = [hit_to_entity(h) for h in same_name_hits]
-
-    # if same-name exists across >=2 different cities -> disambiguate
-    city_set = {c.city_id for c in same_name_candidates if c.city_id}
-    if len(city_set) >= 2:
-        # ---- Step 2.4C: if city_id is present, shortcut to the matching city candidate
-        if city_id:
-            scoped = [c for c in same_name_candidates if c.city_id == city_id]
-            if len(scoped) == 1:
-                chosen = scoped[0]
-                return ResolveResponse(
-                    action="redirect",
-                    query=q,
-                    normalized_query=nq,
-                    url=chosen.canonical_url,
-                    match=chosen,
-                    reason="city_scoped_same_name",
-                    debug={"city_id": city_id, "candidate_count": len(same_name_candidates)},
-                )
-
-        # no city_id (or no unique scoped candidate) -> true disambiguation response
-        return ResolveResponse(
-            action="disambiguate",
-            query=q,
-            normalized_query=nq,
-            candidates=same_name_candidates,
-            reason="same_name",
-            debug={"candidate_count": len(same_name_candidates), "cities": sorted(list(city_set))},
-        )
-
-    # 3) normal resolver scoring (city-aware search)
-    hits, _ = es_search_entities(q=q, limit=5, city_id=city_id)
-    if not hits:
-        # fallback to global for serp; still return url
-        return ResolveResponse(
-            action="serp",
-            query=q,
-            normalized_query=nq,
-            url=build_serp_url(q, city_id),
-            reason="no_results",
-        )
-
-    top = hits[0]
-    second = hits[1] if len(hits) > 1 else None
-    top_score = float(top.get("_score") or 0.0)
-    second_score = float(second.get("_score") or 0.0) if second else 0.0
-    gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
-
-    match = hit_to_entity(top)
-    if top_score >= 5.0 and gap >= 0.30:
-        return ResolveResponse(
-            action="redirect",
-            query=q,
-            normalized_query=nq,
-            url=match.canonical_url,
-            match=match,
-            reason="confident",
-            debug={"top_score": top_score, "second_score": second_score, "gap": gap},
-        )
-
-    return ResolveResponse(
-        action="serp",
-        query=q,
-        normalized_query=nq,
-        url=build_serp_url(q, city_id),
         reason="ambiguous",
         debug={"top_score": top_score, "second_score": second_score, "gap": gap},
     )
@@ -878,23 +866,42 @@ def parse(q: str = Query(..., min_length=1)):
 
 
 # -----------------------
-# Events
+# Events logging
 # -----------------------
-@events.post("/search", response_model=EventOk)
-def log_search(evt: SearchEventIn = Body(...)):
-    payload = evt.model_dump()
-    _append_jsonl(EVENTS_DIR / "search.jsonl", payload)
+@app.post("/api/v1/events/search", response_model=EventOk)
+def log_search(evt: SearchEventIn):
+    append_jsonl(
+        SEARCH_EVENTS_FILE,
+        {
+            "query_id": evt.query_id,
+            "raw_query": evt.raw_query,
+            "normalized_query": evt.normalized_query,
+            "city_id": evt.city_id,
+            "context_url": evt.context_url,
+            "timestamp": evt.timestamp,
+        },
+    )
     return EventOk(ok=True)
 
 
-@events.post("/click", response_model=EventOk)
-def log_click(evt: ClickEventIn = Body(...)):
-    payload = evt.model_dump()
-    _append_jsonl(EVENTS_DIR / "click.jsonl", payload)
+@app.post("/api/v1/events/click", response_model=EventOk)
+def log_click(evt: ClickEventIn):
+    append_jsonl(
+        CLICK_EVENTS_FILE,
+        {
+            "query_id": evt.query_id,
+            "entity_id": evt.entity_id,
+            "entity_type": evt.entity_type,
+            "rank": evt.rank,
+            "url": evt.url,
+            "city_id": evt.city_id,
+            "context_url": evt.context_url,
+            "timestamp": evt.timestamp,
+        },
+    )
     return EventOk(ok=True)
 
 
 # Mount routers
 app.include_router(admin, prefix="/api/v1/admin")
 app.include_router(search, prefix="/api/v1/search")
-app.include_router(events, prefix="/api/v1/events")
