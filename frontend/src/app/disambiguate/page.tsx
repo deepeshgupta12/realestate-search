@@ -7,6 +7,7 @@ type SP = {
   q?: string;
   city_id?: string;
   qid?: string;
+  context_url?: string;
 };
 
 function buildGoHref(args: {
@@ -15,6 +16,8 @@ function buildGoHref(args: {
   entity_id?: string;
   entity_type?: string;
   rank?: number;
+  city_id?: string;
+  context_url?: string;
 }) {
   const p = new URLSearchParams();
   p.set("url", args.url);
@@ -22,6 +25,8 @@ function buildGoHref(args: {
   if (args.entity_id) p.set("entity_id", args.entity_id);
   if (args.entity_type) p.set("entity_type", args.entity_type);
   if (typeof args.rank === "number") p.set("rank", String(args.rank));
+  if (args.city_id) p.set("city_id", args.city_id);
+  if (args.context_url) p.set("context_url", args.context_url);
   return `/go?${p.toString()}`;
 }
 
@@ -35,6 +40,7 @@ export default async function DisambiguatePage({
   const q = (sp.q || "").trim();
   const city_id = (sp.city_id || "").trim() || undefined;
   const qid = (sp.qid || "").trim() || undefined;
+  const context_url = (sp.context_url || "").trim() || "/";
 
   if (!q) {
     return (
@@ -50,7 +56,6 @@ export default async function DisambiguatePage({
 
   const res = await apiGet<ResolveResponse>("/search/resolve", { q, city_id });
 
-  // If backend decides no longer needs disambiguation, respect it.
   if (res.action === "redirect" && res.url) redirect(res.url);
   if (res.action === "serp" && res.url) redirect(res.url);
 
@@ -81,6 +86,8 @@ export default async function DisambiguatePage({
                   entity_id: c.id,
                   entity_type: c.entity_type,
                   rank: idx + 1,
+                  city_id,
+                  context_url,
                 })}
                 style={{ textDecoration: "underline" }}
               >
