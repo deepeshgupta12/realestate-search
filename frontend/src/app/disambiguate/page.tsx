@@ -1,109 +1,102 @@
-"use client";
-
-import React, { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
+import { redirect } from "next/navigation";
 import { apiGet } from "@/lib/api";
-import type { ResolveResponse, EntityOut } from "@/lib/types";
+import type { ResolveResponse } from "@/lib/types";
 
-export default function DisambiguatePage() {
-  const router = useRouter();
-  const sp = useSearchParams();
+type SP = {
+  q?: string;
+  city_id?: string;
+  qid?: string;
+};
 
-  const q = (sp.get("q") || "").trim();
-  const qidParam = (sp.get("qid") || "").trim();
-  const cityId = (sp.get("city_id") || "").trim() || undefined;
-  const contextUrl = (sp.get("context_url") || "/").trim() || "/";
+function buildGoHref(args: {
+  url: string;
+  qid?: string;
+  entity_id?: string;
+  entity_type?: string;
+  rank?: number;
+}) {
+  const p = new URLSearchParams();
+  p.set("url", args.url);
+  if (args.qid) p.set("qid", args.qid);
+  if (args.entity_id) p.set("entity_id", args.entity_id);
+  if (args.entity_type) p.set("entity_type", args.entity_type);
+  if (typeof args.rank === "number") p.set("rank", String(args.rank));
+  return `/go?${p.toString()}`;
+}
 
-  const qid = useMemo(() => qidParam || (globalThis.crypto?.randomUUID?.() ?? `qid_${Date.now()}`), [qidParam]);
+export default async function DisambiguatePage({
+  searchParams,
+}: {
+  searchParams: Promise<SP>;
+}) {
+  const sp = await searchParams;
 
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [resp, setResp] = useState<ResolveResponse | null>(null);
+  const q = (sp.q || "").trim();
+  const city_id = (sp.city_id || "").trim() || undefined;
+  const qid = (sp.qid || "").trim() || undefined;
 
-  useEffect(() => {
-    let mounted = true;
-    async function run() {
-      if (!q) return;
-      setLoading(true);
-      setErr(null);
-      try {
-        const r = await apiGet<ResolveResponse>("/search/resolve", {
-          q,
-          city_id: cityId,
-          context_url: contextUrl,
-        });
-        if (!mounted) return;
-        setResp(r);
-
-        // If backend doesn't return disambiguate, route accordingly
-        if (r.action === "redirect" && r.url) {
-          router.replace(`/go?url=${encodeURIComponent(r.url)}&qid=${encodeURIComponent(qid)}&context_url=${encodeURIComponent(contextUrl)}`);
-          return;
-        }
-        if (r.action === "serp") {
-          const url = r.url || `/search?q=${encodeURIComponent(q)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`;
-          router.replace(`${url}${url.includes("?") ? "&" : "?"}qid=${encodeURIComponent(qid)}&context_url=${encodeURIComponent(contextUrl)}`);
-          return;
-        }
-      } catch (e: any) {
-        if (!mounted) return;
-        setErr(e?.message || "Failed to resolve");
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    }
-    run();
-    return () => {
-      mounted = false;
-    };
-  }, [q, cityId, contextUrl, qid, router]);
-
-  const candidates: EntityOut[] = (resp?.action === "disambiguate" && resp.candidates) ? resp.candidates : [];
-
-  function pick(c: EntityOut, rank: number) {
-    const target = c.canonical_url;
-    router.push(
-      `/go?url=${encodeURIComponent(target)}&qid=${encodeURIComponent(qid)}&eid=${encodeURIComponent(c.id)}&etype=${encodeURIComponent(c.entity_type)}&rank=${encodeURIComponent(
-        String(rank)
-      )}&city_id=${encodeURIComponent(c.city_id || "")}&context_url=${encodeURIComponent(contextUrl)}`
+  if (!q) {
+    return (
+      <main style={{ padding: 24 }}>
+        <h1 style={{ fontSize: 20, fontWeight: 700 }}>Choose a result</h1>
+        <p style={{ marginTop: 8 }}>Missing query.</p>
+        <p style={{ marginTop: 8 }}>
+          <Link href="/">Go back</Link>
+        </p>
+      </main>
     );
   }
 
+  const res = await apiGet<ResolveResponse>("/search/resolve", { q, city_id });
+
+  // If backend decides no longer needs disambiguation, respect it.
+  if (res.action === "redirect" && res.url) redirect(res.url);
+  if (res.action === "serp" && res.url) redirect(res.url);
+
+  const candidates = res.candidates || [];
+
   return (
-    <main className="min-h-screen px-6 py-10">
-      <div className="mx-auto max-w-3xl">
-        <h1 className="text-2xl font-semibold">Which one did you mean?</h1>
-        <div className="mt-2 text-sm opacity-70">
-          Query: <span className="font-mono">{q || "(empty)"}</span>
+    <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 20, fontWeight: 700 }}>Which “{q}” did you mean?</h1>
+      <p style={{ marginTop: 6, opacity: 0.8 }}>
+        Multiple matches found. Pick one to continue.
+      </p>
+
+      {candidates.length === 0 ? (
+        <div style={{ marginTop: 16 }}>
+          <p>No candidates returned.</p>
+          <p style={{ marginTop: 8 }}>
+            <Link href={`/search?q=${encodeURIComponent(q)}`}>See all results</Link>
+          </p>
         </div>
+      ) : (
+        <ul style={{ marginTop: 16, paddingLeft: 18 }}>
+          {candidates.map((c, idx) => (
+            <li key={c.id} style={{ marginBottom: 10 }}>
+              <Link
+                href={buildGoHref({
+                  url: c.canonical_url,
+                  qid,
+                  entity_id: c.id,
+                  entity_type: c.entity_type,
+                  rank: idx + 1,
+                })}
+                style={{ textDecoration: "underline" }}
+              >
+                {c.name}
+              </Link>
+              <span style={{ marginLeft: 8, opacity: 0.8 }}>
+                — {c.city}
+                {c.parent_name ? ` · ${c.parent_name}` : ""}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
 
-        {loading && <div className="mt-6 text-sm opacity-70">Loading…</div>}
-        {err && <div className="mt-6 text-sm text-red-400">{err}</div>}
-
-        {!loading && !err && resp?.action === "disambiguate" && (
-          <div className="mt-6 space-y-3">
-            {candidates.length === 0 ? (
-              <div className="text-sm opacity-70">No candidates returned.</div>
-            ) : (
-              candidates.map((c, idx) => (
-                <button
-                  key={`${c.id}-${idx}`}
-                  type="button"
-                  onClick={() => pick(c, idx + 1)}
-                  className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left hover:bg-white/10"
-                >
-                  <div className="text-base font-medium">{c.name}</div>
-                  <div className="mt-1 text-xs opacity-70">
-                    <span className="font-mono">{c.entity_type}</span>
-                    {c.city ? <span> · {c.city}</span> : null}
-                    {c.parent_name ? <span> · {c.parent_name}</span> : null}
-                  </div>
-                  <div className="mt-2 text-xs opacity-60 font-mono">{c.canonical_url}</div>
-                </button>
-              ))
-            )}
-          </div>
-        )}
+      <div style={{ marginTop: 18 }}>
+        <Link href={`/search?q=${encodeURIComponent(q)}`}>See all results</Link>
       </div>
     </main>
   );
