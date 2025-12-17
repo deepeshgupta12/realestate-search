@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -154,7 +153,6 @@ CONSTRAINT_PATTERNS = [
     r"\brent\b|\brental\b|\blease\b",
     r"\bresale\b|\bbuy\b|\bsale\b",
 ]
-
 CONSTRAINT_RE = re.compile("|".join(CONSTRAINT_PATTERNS), re.I)
 
 
@@ -177,7 +175,6 @@ def load_redirects() -> Dict[str, str]:
         if REDIRECTS_FILE.exists():
             data = json.loads(REDIRECTS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # normalize keys/values to leading slash paths
                 out: Dict[str, str] = {}
                 for k, v in data.items():
                     if not isinstance(k, str) or not isinstance(v, str):
@@ -210,7 +207,6 @@ def extract_clean_path(raw_q: str) -> Optional[str]:
     if not q:
         return None
 
-    # full URL
     if "://" in q:
         try:
             u = urlparse(q)
@@ -218,28 +214,30 @@ def extract_clean_path(raw_q: str) -> Optional[str]:
         except Exception:
             return None
     else:
-        # path-like
         path = q
 
     path = path.strip()
     if not path:
         return None
 
-    # convert "pune/baner" -> "/pune/baner"
     if not path.startswith("/"):
         if "/" in path:
             path = "/" + path
         else:
-            return None  # single token, not a path
+            return None
 
-    # remove trailing slash unless root
     if path != "/" and path.endswith("/"):
         path = path[:-1]
 
     return path
 
 
-def build_serp_url(q: str, city_id: Optional[str] = None, qid: Optional[str] = None, context_url: Optional[str] = None) -> str:
+def build_serp_url(
+    q: str,
+    city_id: Optional[str] = None,
+    qid: Optional[str] = None,
+    context_url: Optional[str] = None,
+) -> str:
     params = [f"q={quote_plus(q)}"]
     if city_id:
         params.append(f"city_id={quote_plus(city_id)}")
@@ -281,6 +279,23 @@ def group_entities(entities: List[EntityOut]) -> SuggestGroups:
     return g
 
 
+def active_or_missing_status_filter() -> Dict[str, Any]:
+    """
+    Treat docs as eligible if:
+      - status == "active"
+      - OR status field is missing (legacy docs)
+    """
+    return {
+        "bool": {
+            "should": [
+                {"term": {"status": "active"}},
+                {"bool": {"must_not": [{"exists": {"field": "status"}}]}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
 def es_search_entities(q: str, limit: int = 10, city_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     Returns (hits, did_you_mean)
@@ -289,7 +304,7 @@ def es_search_entities(q: str, limit: int = 10, city_id: Optional[str] = None) -
     if not nq:
         return [], None
 
-    must: List[Dict[str, Any]] = [{"term": {"status": "active"}}]
+    must: List[Dict[str, Any]] = [active_or_missing_status_filter()]
     if city_id:
         must.append({"term": {"city_id": city_id}})
 
@@ -335,6 +350,7 @@ def es_search_entities(q: str, limit: int = 10, city_id: Optional[str] = None) -
 def es_find_by_canonical_url(path: str) -> Optional[Dict[str, Any]]:
     """
     Exact lookup by canonical_url keyword.
+    Tolerant to legacy docs with missing status.
     """
     path = path.strip()
     if not path:
@@ -345,7 +361,7 @@ def es_find_by_canonical_url(path: str) -> Optional[Dict[str, Any]]:
         "query": {
             "bool": {
                 "must": [
-                    {"term": {"status": "active"}},
+                    active_or_missing_status_filter(),
                     {"term": {"canonical_url": path}},
                 ]
             }
@@ -394,165 +410,10 @@ def ping_es() -> AdminOk:
     )
 
 
-@admin.post("/create-index", response_model=AdminOk)
-def create_index() -> AdminOk:
-    if es.indices.exists(index=ES_INDEX):
-        return AdminOk(ok=True, message=f"Index {ES_INDEX} already exists")
-
-    mapping = {
-        "settings": {
-            "analysis": {
-                "analyzer": {
-                    "folding": {
-                        "tokenizer": "standard",
-                        "filter": ["lowercase", "asciifolding"],
-                    }
-                }
-            }
-        },
-        "mappings": {
-            "properties": {
-                "id": {"type": "keyword"},
-                "entity_type": {"type": "keyword"},
-                "name": {"type": "text", "analyzer": "folding"},
-                "name_norm": {"type": "keyword"},
-                "aliases": {"type": "text", "analyzer": "folding"},
-                "city": {"type": "keyword"},
-                "city_id": {"type": "keyword"},
-                "parent_name": {"type": "keyword"},
-                "canonical_url": {"type": "keyword"},
-                "status": {"type": "keyword"},
-                "popularity_score": {"type": "float"},
-            }
-        },
-    }
-    es.indices.create(index=ES_INDEX, body=mapping)
-    return AdminOk(ok=True, message=f"Created index {ES_INDEX}")
-
-
-@admin.post("/seed", response_model=AdminOk)
-def seed() -> AdminOk:
-    """
-    Minimal demo seed. Safe to re-run.
-    """
-    docs = [
-        {
-            "id": "builder_dlf",
-            "entity_type": "builder",
-            "name": "DLF",
-            "name_norm": "dlf",
-            "aliases": ["dlf limited"],
-            "city": "",
-            "city_id": "",
-            "parent_name": "",
-            "canonical_url": "/builders/dlf",
-            "status": "active",
-            "popularity_score": 95.0,
-        },
-        {
-            "id": "city_noida",
-            "entity_type": "city",
-            "name": "Noida",
-            "name_norm": "noida",
-            "aliases": [],
-            "city": "Noida",
-            "city_id": "city_noida",
-            "parent_name": "",
-            "canonical_url": "/noida",
-            "status": "active",
-            "popularity_score": 90.0,
-        },
-        {
-            "id": "proj_godrej_woods",
-            "entity_type": "project",
-            "name": "Godrej Woods",
-            "name_norm": "godrej woods",
-            "aliases": ["godrej woods noida"],
-            "city": "Noida",
-            "city_id": "city_noida",
-            "parent_name": "Sector 43",
-            "canonical_url": "/projects/noida/godrej-woods",
-            "status": "active",
-            "popularity_score": 88.0,
-        },
-        {
-            "id": "city_pune",
-            "entity_type": "city",
-            "name": "Pune",
-            "name_norm": "pune",
-            "aliases": [],
-            "city": "Pune",
-            "city_id": "city_pune",
-            "parent_name": "",
-            "canonical_url": "/pune",
-            "status": "active",
-            "popularity_score": 85.0,
-        },
-        {
-            "id": "loc_baner_pune",
-            "entity_type": "locality",
-            "name": "Baner",
-            "name_norm": "baner",
-            "aliases": ["baner pune"],
-            "city": "Pune",
-            "city_id": "city_pune",
-            "parent_name": "West Pune",
-            "canonical_url": "/pune/baner",
-            "status": "active",
-            "popularity_score": 80.0,
-        },
-        {
-            "id": "mm_sector150_noida",
-            "entity_type": "micromarket",
-            "name": "Sector 150",
-            "name_norm": "sector 150",
-            "aliases": ["sec 150"],
-            "city": "Noida",
-            "city_id": "city_noida",
-            "parent_name": "Noida Expressway",
-            "canonical_url": "/noida/sector-150",
-            "status": "active",
-            "popularity_score": 78.0,
-        },
-        {
-            "id": "rate_baner",
-            "entity_type": "rate_page",
-            "name": "Baner Property Rates",
-            "name_norm": "baner property rates",
-            "aliases": ["baner rates", "baner price trend"],
-            "city": "Pune",
-            "city_id": "city_pune",
-            "parent_name": "Baner",
-            "canonical_url": "/property-rates/pune/baner",
-            "status": "active",
-            "popularity_score": 60.0,
-        },
-        {
-            "id": "pdp_resale_1",
-            "entity_type": "property_pdp",
-            "name": "2 BHK Resale Apartment in Baner",
-            "name_norm": "2 bhk resale apartment in baner",
-            "aliases": ["2 bhk baner resale"],
-            "city": "Pune",
-            "city_id": "city_pune",
-            "parent_name": "Baner",
-            "canonical_url": "/pune/baner/resale/2-bhk-apartment-123",
-            "status": "active",
-            "popularity_score": 40.0,
-        },
-    ]
-
-    for d in docs:
-        es.index(index=ES_INDEX, id=d["id"], body=d)
-
-    es.indices.refresh(index=ES_INDEX)
-    return AdminOk(ok=True, seeded=True, message="Seeded docs")
-
-
 @search.get("/zero-state", response_model=ZeroStateResponse)
 def zero_state(city_id: Optional[str] = None, limit: int = 8, context_url: Optional[str] = None) -> ZeroStateResponse:
-    # Global trending derived from popularity_score
-    hits, _ = es_search_entities(q="pune", limit=200, city_id=None)  # hack to pull something; we’ll sort below
+    # Trending derived from popularity_score (best-effort V0)
+    hits, _ = es_search_entities(q="pune", limit=200, city_id=None)
     all_entities = [hit_to_entity(h) for h in hits]
     all_entities = [e for e in all_entities if e.popularity_score is not None]
     all_entities.sort(key=lambda e: float(e.popularity_score or 0.0), reverse=True)
@@ -584,7 +445,6 @@ def suggest(q: str, city_id: Optional[str] = None, limit: int = 10, context_url:
 
     fb = SearchFallbacks(relaxed_used=False, trending=[], reason=None)
     if not entities:
-        # relaxed fallback: trending
         z = zero_state(city_id=city_id, limit=limit, context_url=context_url)
         fb = SearchFallbacks(relaxed_used=True, trending=z.trending_searches, reason="no_results")
 
@@ -599,7 +459,6 @@ def suggest(q: str, city_id: Optional[str] = None, limit: int = 10, context_url:
 
 @search.get("", response_model=SuggestResponse)
 def serp_search(q: str, city_id: Optional[str] = None, limit: int = 20, context_url: Optional[str] = None) -> SuggestResponse:
-    # same shape as suggest (V0)
     return suggest(q=q, city_id=city_id, limit=limit, context_url=context_url)
 
 
@@ -611,7 +470,6 @@ def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = 
     # 1) Long-tail / clean URL handling (with redirect registry)
     clean_path = extract_clean_path(raw_q)
     if clean_path:
-        # a) redirects registry first
         target = REDIRECTS.get(clean_path)
         if target:
             return ResolveResponse(
@@ -624,7 +482,6 @@ def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = 
                 debug={"clean_path": clean_path, "target": target},
             )
 
-        # b) direct canonical_url lookup in ES
         hit = es_find_by_canonical_url(clean_path)
         if hit:
             ent = hit_to_entity(hit)
@@ -638,7 +495,6 @@ def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = 
                 debug={"clean_path": clean_path},
             )
 
-        # c) path-like but no match -> SERP (must NOT crash)
         return ResolveResponse(
             action="serp",
             query=raw_q,
@@ -673,11 +529,9 @@ def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = 
     second = entities[1] if len(entities) > 1 else None
 
     # 4) Same-name disambiguation (city-scoped shortcut)
-    # if top 2 share same normalized name AND same entity_type but different city_id -> disambiguate
     if second and (top.name.strip().lower() == second.name.strip().lower()) and (top.entity_type == second.entity_type):
         candidates = [e for e in entities if e.name.strip().lower() == top.name.strip().lower() and e.entity_type == top.entity_type]
 
-        # city-scoped shortcut
         if city_id:
             scoped = [c for c in candidates if (c.city_id or "") == city_id]
             if len(scoped) == 1:
@@ -700,7 +554,7 @@ def resolve(q: str, city_id: Optional[str] = None, context_url: Optional[str] = 
             debug={"candidate_count": len(candidates), "cities": sorted(list({c.city_id for c in candidates if c.city_id}))},
         )
 
-    # 5) Default ambiguous -> SERP (kept conservative)
+    # 5) Default ambiguous -> SERP
     return ResolveResponse(
         action="serp",
         query=raw_q,
