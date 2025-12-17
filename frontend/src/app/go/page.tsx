@@ -54,12 +54,12 @@ export default async function GoPage({ searchParams }: PageProps) {
   const qid = sp1(sp.qid);
 
   // Optional: entity metadata from UI click (for logging)
-  const eid = sp1(sp.eid);
-  const etype = sp1(sp.etype);
+  let eid = sp1(sp.eid);
+  let etype = sp1(sp.etype);
   const rankStr = sp1(sp.rank);
   const rank = rankStr ? Math.max(1, Number(rankStr) || 1) : 1;
 
-  // Support legacy direct URL navigation if ever used
+  // Legacy direct URL navigation
   const directUrl = sp1(sp.url);
 
   // If no query but url exists, just go there (and optionally log click)
@@ -71,8 +71,8 @@ export default async function GoPage({ searchParams }: PageProps) {
         entity_type: etype,
         rank,
         url: directUrl,
-        city_id,
-        context_url,
+        city_id: city_id ?? null,
+        context_url: context_url ?? null,
       });
     }
     redirect(directUrl);
@@ -101,8 +101,19 @@ export default async function GoPage({ searchParams }: PageProps) {
   const action = resolved?.action as string | undefined;
   const url = resolved?.url as string | null | undefined;
 
+  // Infer missing click metadata from resolve.match (so logs don’t miss city_id)
+  const match = resolved?.match || null;
+  const inferredCityId: string | null = city_id ?? match?.city_id ?? null;
+  const inferredContextUrl: string | null = context_url ?? match?.context_url ?? null;
+
   if (action === "redirect" && url) {
-    // log click (if UI supplied entity metadata)
+    // If UI didn't pass entity info, infer from match (best-effort)
+    if ((!eid || !etype) && match?.id && match?.entity_type) {
+      eid = match.id;
+      etype = match.entity_type;
+    }
+
+    // log click (if we have qid + entity metadata)
     if (qid && eid && etype) {
       await postClickEvent({
         query_id: qid,
@@ -110,10 +121,11 @@ export default async function GoPage({ searchParams }: PageProps) {
         entity_type: etype,
         rank,
         url,
-        city_id,
-        context_url,
+        city_id: inferredCityId,
+        context_url: inferredContextUrl,
       });
     }
+
     redirect(url);
   }
 
@@ -122,7 +134,6 @@ export default async function GoPage({ searchParams }: PageProps) {
     d.set("q", rawQ);
     if (qid) d.set("qid", qid);
     if (context_url) d.set("context_url", context_url);
-    // (city_id intentionally not forced here; user will pick)
     redirect(`/disambiguate?${d.toString()}`);
   }
 
