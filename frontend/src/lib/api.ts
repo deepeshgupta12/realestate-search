@@ -1,14 +1,13 @@
-/**
- * Frontend API helper
- * - Always targets NEXT_PUBLIC_API_BASE (defaults to localhost:8000)
- * - Auto-prefixes relative paths with /api/v1
- * - Exposes buildUrl for places that need direct URLs
- */
+// frontend/src/lib/api.ts
+type Query = Record<string, string | number | boolean | null | undefined>;
 
-export const API_PREFIX = "/api/v1";
-
-function apiBase(): string {
-  return (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/+$/, "");
+function baseUrl(): string {
+  // Prefer 127.0.0.1 to avoid IPv6 localhost issues in Node fetch.
+  return (
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    process.env.API_BASE_URL ||
+    "http://127.0.0.1:8000"
+  );
 }
 
 function ensureLeadingSlash(p: string): string {
@@ -16,87 +15,70 @@ function ensureLeadingSlash(p: string): string {
   return p.startsWith("/") ? p : `/${p}`;
 }
 
-function normalizePath(path: string): string {
-  // absolute URL -> leave as-is
+/**
+ * Auto-prefix API paths so FE can call:
+ *   /search/..., /events/..., /admin/...
+ * and we convert it to:
+ *   /api/v1/search/..., /api/v1/events/..., /api/v1/admin/...
+ */
+function normalizeApiPath(path: string): string {
+  // If already absolute URL, do nothing
   if (/^https?:\/\//i.test(path)) return path;
 
   const p = ensureLeadingSlash(path);
 
-  // already versioned or special endpoints
-  if (p.startsWith(API_PREFIX + "/")) return p;
-  if (p === API_PREFIX) return p;
-  if (p === "/health" || p.startsWith("/health?")) return p;
+  // Already versioned
+  if (p.startsWith("/api/")) return p;
 
-  // otherwise prefix
-  return `${API_PREFIX}${p}`;
+  // Only prefix API routes we own
+  if (p.startsWith("/search") || p.startsWith("/events") || p.startsWith("/admin")) {
+    return `/api/v1${p}`;
+  }
+
+  // Leave other paths (if any) untouched
+  return p;
 }
 
-export function buildUrl(
-  path: string,
-  params?: Record<string, string | number | boolean | null | undefined>
-): string {
-  const normalized = normalizePath(path);
+export function buildUrl(path: string, query?: Query): string {
+  const normalized = normalizeApiPath(path);
+  const url = new URL(normalized, baseUrl());
 
-  // If normalized is still absolute, URL() will handle it fine.
-  const u = new URL(normalized, apiBase());
-
-  if (params) {
-    for (const [k, v] of Object.entries(params)) {
-      if (v === undefined || v === null) continue;
-      u.searchParams.set(k, String(v));
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === null || v === undefined) continue;
+      const s = String(v).trim();
+      if (!s) continue;
+      url.searchParams.set(k, s);
     }
   }
 
-  return u.toString();
+  return url.toString();
 }
 
-async function readJsonOrText(res: Response) {
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return res.json();
-  const t = await res.text();
-  try {
-    return JSON.parse(t);
-  } catch {
-    return t;
-  }
-}
-
-export async function apiGet<T>(
-  path: string,
-  params?: Record<string, string | number | boolean | null | undefined>
-): Promise<T> {
-  const url = buildUrl(path, params);
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-
+export async function apiGet<T>(path: string, query?: Query): Promise<T> {
+  const res = await fetch(buildUrl(path, query), { cache: "no-store" });
   if (!res.ok) {
-    const body = await readJsonOrText(res);
-    throw new Error(`GET ${new URL(url).pathname}${new URL(url).search} failed: ${res.status} ${JSON.stringify(body)}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`GET ${path} failed: ${res.status} ${text}`);
   }
-
   return (await res.json()) as T;
 }
 
 export async function apiPost<T>(
   path: string,
   body: unknown,
-  params?: Record<string, string | number | boolean | null | undefined>
+  query?: Query
 ): Promise<T> {
-  const url = buildUrl(path, params);
-  const res = await fetch(url, {
+  const res = await fetch(buildUrl(path, query), {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     cache: "no-store",
   });
 
   if (!res.ok) {
-    const b = await readJsonOrText(res);
-    throw new Error(`POST ${new URL(url).pathname}${new URL(url).search} failed: ${res.status} ${JSON.stringify(b)}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`POST ${path} failed: ${res.status} ${text}`);
   }
-
   return (await res.json()) as T;
 }
