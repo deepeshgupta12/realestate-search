@@ -2,6 +2,8 @@
 import { redirect } from "next/navigation";
 import { buildUrl } from "@/lib/api";
 
+export const dynamic = "force-dynamic";
+
 type ResolveResponse = {
   action: "redirect" | "serp" | "disambiguate";
   query: string;
@@ -13,8 +15,11 @@ type ResolveResponse = {
   debug: any | null;
 };
 
+type SP = Record<string, string | string[] | undefined>;
+
 type PageProps = {
-  searchParams?: Record<string, string | string[] | undefined>;
+  // In some Next versions this is an object, in others it can be a Promise.
+  searchParams?: SP | Promise<SP>;
 };
 
 function sp1(v: string | string[] | undefined): string | undefined {
@@ -23,12 +28,13 @@ function sp1(v: string | string[] | undefined): string | undefined {
 }
 
 export default async function GoPage({ searchParams }: PageProps) {
-  const q = sp1(searchParams?.q);
-  const city_id = sp1(searchParams?.city_id);
-  const context_url = sp1(searchParams?.context_url) || "/";
+  // ✅ Works whether searchParams is an object or a Promise
+  const sp: SP = await Promise.resolve(searchParams ?? {});
 
-  // Optional but recommended: qid for click logging attribution
-  const qid = sp1(searchParams?.qid);
+  const q = sp1(sp.q);
+  const city_id = sp1(sp.city_id);
+  const context_url = sp1(sp.context_url) || "/";
+  const qid = sp1(sp.qid);
 
   if (!q || !q.trim()) {
     redirect("/");
@@ -42,20 +48,22 @@ export default async function GoPage({ searchParams }: PageProps) {
 
   const res = await fetch(resolveUrl, { cache: "no-store" });
   if (!res.ok) {
-    // If backend is down, fail safe to SERP
     redirect(`/search?q=${encodeURIComponent(q)}`);
   }
 
   const data = (await res.json()) as ResolveResponse;
 
-  // If backend gives a URL, trust it
   if (data.action === "redirect" && data.url) {
     redirect(data.url);
   }
 
   if (data.action === "serp") {
     if (data.url) redirect(data.url);
-    redirect(`/search?q=${encodeURIComponent(q)}${city_id ? `&city_id=${encodeURIComponent(city_id)}` : ""}`);
+    redirect(
+      `/search?q=${encodeURIComponent(q)}${
+        city_id ? `&city_id=${encodeURIComponent(city_id)}` : ""
+      }`
+    );
   }
 
   // disambiguate
