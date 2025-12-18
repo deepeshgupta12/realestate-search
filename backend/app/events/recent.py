@@ -7,37 +7,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 
-
-# Path to the JSONL search events file
-SEARCH_LOG_PATH = Path(__file__).resolve().parent.parent / ".events" / "search.jsonl"
+# IMPORTANT: reuse the same log path used by the event writer (store.py)
+from .store import SEARCH_LOG as SEARCH_LOG_PATH
 
 
 @dataclass
 class RecentQuery:
-    """Lightweight representation of a recent search query.
-
-    We keep this intentionally simple so it is easy to evolve later.
-    """
+    """Lightweight representation of a recent search query."""
     raw_query: str
     normalized_query: str
     city_id: Optional[str] = None
     context_url: Optional[str] = None
-    timestamp: Optional[str] = None  # ISO string; string is fine for display/sorting
+    timestamp: Optional[str] = None
 
 
 def _iter_log_lines(path: Path) -> Iterable[str]:
-    """Yield lines from the log file in reverse order (newest first).
-
-    For dev / local usage, reading the whole file and reversing is fine.
-    We can optimize later if needed.
-    """
+    """Yield lines from the log file in reverse order (newest first)."""
     if not path.exists():
         return []
 
     with path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # Newest events are at the bottom; iterate from newest to oldest
     return reversed(lines)
 
 
@@ -48,7 +39,7 @@ def load_recent_queries(
 ) -> List[RecentQuery]:
     """Load deduplicated recent queries from the search events log.
 
-    - Reads from backend/.events/search.jsonl
+    - Reads from backend/.events/search.jsonl (same as event writer)
     - Returns at most `limit` RecentQuery objects
     - Dedupes by (normalized_query, city_id)
     - If `city_id` is provided, filters only that city
@@ -65,7 +56,6 @@ def load_recent_queries(
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            # Skip malformed lines instead of crashing the endpoint
             continue
 
         raw_q = (obj.get("raw_query") or "").strip()
@@ -77,14 +67,12 @@ def load_recent_queries(
         if not norm_q:
             continue
 
-        # If caller passed a city_id, filter by that
         if city_id is not None and line_city != city_id:
             continue
 
         key = (norm_q.lower(), line_city)
         if key in seen:
             continue
-
         seen.add(key)
 
         results.append(
@@ -103,13 +91,10 @@ def load_recent_queries(
     return results
 
 
-# Backwards-/forwards-compat alias used in some of our earlier iterations.
-# main.py can safely import either name.
 def load_recent_searches(
     city_id: Optional[str] = None,
     limit: int = 8,
     log_path: Optional[Path] = None,
 ) -> List[RecentQuery]:
-    """Alias wrapper so both `load_recent_queries` and `load_recent_searches`
-    can be used from main.py without breaking."""
+    """Alias wrapper for callers."""
     return load_recent_queries(city_id=city_id, limit=limit, log_path=log_path)
