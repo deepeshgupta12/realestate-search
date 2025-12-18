@@ -26,3 +26,9 @@ backend/.events/
 # ---- Backup files created during edits ----
 *.bak
 *.bak_*
+
+# macOS Finder junk
+.DS_Store
+backend/.DS_Store
+backend/app/.DS_Store
+frontend/.DS_Store

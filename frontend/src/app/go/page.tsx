@@ -1,125 +1,155 @@
 import { redirect } from "next/navigation";
-import { apiGet, apiPost } from "@/lib/api";
 
-export const dynamic = "force-dynamic";
+type SearchParams = Record<string, string | string[] | undefined>;
+
+type PageProps = {
+  searchParams: Promise<SearchParams>;
+};
 
 type ResolveResponse = {
   action: "redirect" | "serp" | "disambiguate";
   query: string;
   normalized_query: string;
   url: string | null;
-  match?: any | null;
+  reason: string;
+  // optional fields (safe if backend includes them)
+  match?: any;
   candidates?: any[] | null;
-  reason?: string | null;
+  debug?: any;
 };
 
-function sp1(v: string | string[] | undefined | null): string {
-  if (!v) return "";
-  return Array.isArray(v) ? (v[0] ?? "") : v;
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+function sp1(v: string | string[] | undefined): string {
+  if (Array.isArray(v)) return (v[0] || "").trim();
+  return (v || "").trim();
 }
 
-function ensureLeadingSlash(u: string): string {
-  if (!u) return "/";
-  return u.startsWith("/") ? u : `/${u}`;
+function withParams(baseUrl: string, params: Record<string, string | null | undefined>): string {
+  const u = new URL(baseUrl, "http://local");
+  for (const [k, val] of Object.entries(params)) {
+    if (val === undefined || val === null || String(val).trim() === "") continue;
+    if (!u.searchParams.has(k)) u.searchParams.set(k, String(val));
+  }
+  const out = u.pathname + (u.search ? u.search : "");
+  return out;
 }
 
-function appendParam(baseUrl: string, key: string, value: string): string {
-  if (!value) return baseUrl;
-  const hasQ = baseUrl.includes("?");
-  const sep = hasQ ? "&" : "?";
-  return `${baseUrl}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+async function postJson(path: string, payload: any): Promise<void> {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
+    // Don’t block navigation if logging fails
+    if (!res.ok) {
+      // swallow
+    }
+  } catch {
+    // swallow
+  }
 }
 
-function uuid(): string {
-  // Node 18+ supports crypto.randomUUID()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const c: any = globalThis.crypto;
-  if (c?.randomUUID) return c.randomUUID();
-  return `qid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
+async function getResolve(params: Record<string, string | undefined>): Promise<ResolveResponse | null> {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v && v.trim()) usp.set(k, v);
+  }
 
-type PageProps = {
-  // Next 15 can pass searchParams as Promise (sync-dynamic-apis)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  searchParams: any;
-};
+  const url = `${API_BASE}/api/v1/search/resolve?${usp.toString()}`;
+
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    return (await res.json()) as ResolveResponse;
+  } catch {
+    return null;
+  }
+}
 
 export default async function GoPage({ searchParams }: PageProps) {
-  const sp = await Promise.resolve(searchParams);
+  const sp = await searchParams;
 
-  const q = sp1(sp.q);
-  const url = sp1(sp.url);
+  const q = sp1(sp?.q);
+  const directUrl = sp1(sp?.url);
 
-  const from_q = sp1(sp.from_q);
-  const entity_id = sp1(sp.entity_id);
-  const entity_type = sp1(sp.entity_type);
-  const rankStr = sp1(sp.rank);
+  const city_id = sp1(sp?.city_id) || "";
+  const context_url = sp1(sp?.context_url) || "/";
 
-  const city_id = sp1(sp.city_id) || null;
-  const context_url = sp1(sp.context_url) || "/";
+  // click logging inputs (optional)
+  const qid = sp1(sp?.qid) || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
+  const entity_id = sp1(sp?.entity_id) || "";
+  const entity_type = sp1(sp?.entity_type) || "";
+  const rankRaw = sp1(sp?.rank) || "";
+  const rank = rankRaw ? Number(rankRaw) : null;
 
-  // --- CLICK MODE: /go?url=/pune/baner&entity_id=...&entity_type=...&rank=1 ---
-  if (url) {
-    // Optional click logging (only if we have enough metadata)
-    if (entity_id && entity_type) {
-      const qid = sp1(sp.qid) || uuid();
-      const rank = rankStr ? Number(rankStr) : 1;
-
-      await apiPost("/events/click", {
+  // Case 1: Direct URL redirect (used by SERP/disambiguate cards)
+  if (directUrl) {
+    // log click if we have enough info
+    if (entity_id && entity_type && rank !== null) {
+      await postJson("/api/v1/events/click", {
         query_id: qid,
         entity_id,
         entity_type,
-        rank: Number.isFinite(rank) ? rank : 1,
-        url: ensureLeadingSlash(url),
-        city_id,
-        context_url,
+        rank,
+        url: directUrl,
+        city_id: city_id || null,
+        context_url: context_url || null,
         timestamp: new Date().toISOString(),
       });
     }
 
-    redirect(ensureLeadingSlash(url));
+    redirect(directUrl);
   }
 
-  // --- SEARCH MODE: /go?q=baner ---
-  if (!q) {
-    redirect("/");
-  }
+  // Case 2: resolve query -> redirect to entity / serp / disambiguate
+  if (!q) redirect("/");
 
-  const qid = uuid();
-
-  const resolvePath =
-    `/search/resolve?q=${encodeURIComponent(q)}` +
-    (city_id ? `&city_id=${encodeURIComponent(city_id)}` : "") +
-    `&context_url=${encodeURIComponent(context_url)}`;
-
-  const res = await apiGet<ResolveResponse>(resolvePath);
-
-  // log search (always)
-  await apiPost("/events/search", {
-    query_id: qid,
-    raw_query: q,
-    normalized_query: res?.normalized_query || q.trim().toLowerCase(),
-    city_id,
-    context_url,
-    timestamp: new Date().toISOString(),
+  const rr = await getResolve({
+    q,
+    city_id: city_id || undefined,
+    context_url: context_url || undefined,
+    qid, // backend may ignore; safe
   });
 
-  // Redirect decisions
-  if (res.action === "redirect" && res.url) {
-    redirect(ensureLeadingSlash(res.url));
+  // If backend fails, fallback to SERP
+  if (!rr || !rr.url) {
+    const fallback = withParams("/search", {
+      q,
+      city_id: city_id || undefined,
+      qid,
+      context_url,
+    });
+    redirect(fallback);
   }
 
-  if (res.action === "disambiguate") {
-    let target = `/disambiguate?q=${encodeURIComponent(q)}&qid=${encodeURIComponent(qid)}`;
-    if (city_id) target = appendParam(target, "city_id", city_id);
-    target = appendParam(target, "context_url", context_url);
-    redirect(target);
+  // Ensure qid + context_url survive the redirect (important for click logging later)
+  if (rr.action === "serp") {
+    const serpUrl = withParams(rr.url, {
+      qid,
+      context_url,
+      city_id: city_id || undefined,
+    });
+    redirect(serpUrl);
   }
 
-  // SERP fallback
-  let serp = res.url ? ensureLeadingSlash(res.url) : `/search?q=${encodeURIComponent(q)}`;
-  serp = appendParam(serp, "qid", qid);
-  if (city_id) serp = appendParam(serp, "city_id", city_id);
-  serp = appendParam(serp, "context_url", context_url);
-  redirect(serp);
+  if (rr.action === "disambiguate") {
+    const disUrl = withParams("/disambiguate", {
+      q,
+      qid,
+      context_url,
+      city_id: city_id || undefined,
+    });
+    redirect(disUrl);
+  }
+
+  // redirect action
+  const redUrl = withParams(rr.url, {
+    qid,
+    context_url,
+    city_id: city_id || undefined,
+  });
+  redirect(redUrl);
 }

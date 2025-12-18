@@ -114,15 +114,16 @@ class ParseResponse(BaseModel):
     currency: str = "INR"
     ok: bool = True
 
-class RecentSearch(BaseModel):
+class RecentSearchOut(BaseModel):
     q: str
     city_id: Optional[str] = None
-    ts: Optional[str] = None  # ISO timestamp string from the event log
+    context_url: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 class ZeroStateResponse(BaseModel):
-    city_id: Optional[str]
-    recent_searches: List[RecentSearch]
+    city_id: Optional[str] = None
+    recent_searches: List[RecentSearchOut]
     trending_searches: List[EntityOut]
     trending_localities: List[EntityOut]
     popular_entities: List[EntityOut]
@@ -667,41 +668,71 @@ def suggest(
 
 @search.get("/zero-state", response_model=ZeroStateResponse)
 def zero_state(
-    city_id: Optional[str] = Query(None),
-    limit: int = Query(8, ge=1, le=24),
-) -> ZeroStateResponse:
+    city_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=8, ge=1, le=32),
+):
     """
-    Zero-state payload for the search bar:
-    - recent_searches: derived from search event log
-    - trending_searches: global/city trending entities
-    - trending_localities: filtered from trending_searches
-    - popular_entities: alias to trending_searches (for flexibility)
+    Zero-state payload for the search box:
+    - recent_searches: last N unique queries from JSONL logs
+    - trending_searches: top entities across all types
+    - trending_localities: subset of trending_searches (cities/localities/mm)
+    - popular_entities: same list as trending_searches (alias)
     """
-    es = get_es()
+    trending = fetch_trending(city_id=city_id, limit=limit)
 
-    # 1) Recent searches from event log (per city when available)
-    recent_events: List[RecentQuery] = load_recent_queries(city_id=city_id, limit=5)
-    recent_searches: List[RecentSearch] = [
-        RecentSearch(q=ev.q, city_id=ev.city_id, ts=ev.ts) for ev in recent_events
+    # --- Recent searches (fully guarded, never allowed to crash) ---
+    try:
+        from app.events.recent import load_recent_searches  # type: ignore
+        raw_recents = load_recent_searches(city_id=city_id, limit=limit)
+    except Exception as e:  # pragma: no cover - safety net only
+        print(f"[zero-state] recent_searches error: {e}")
+        raw_recents = []
+
+    recent_items: List[RecentSearchOut] = []
+    for item in raw_recents:
+        # Works whether recent.py returns dataclasses or dicts
+        if isinstance(item, dict):
+            q = (item.get("q") or item.get("normalized_query") or item.get("raw_query") or "").strip()
+            city_val = item.get("city_id")
+            context_url = item.get("context_url")
+            ts = item.get("timestamp")
+        else:
+            q = (
+                getattr(item, "q", None)
+                or getattr(item, "normalized_query", None)
+                or getattr(item, "raw_query", None)
+                or ""
+            ).strip()
+            city_val = getattr(item, "city_id", None)
+            context_url = getattr(item, "context_url", None)
+            ts = getattr(item, "timestamp", None)
+
+        if not q:
+            continue
+
+        recent_items.append(
+            RecentSearchOut(
+                q=q,
+                city_id=city_val,
+                context_url=context_url,
+                timestamp=ts,
+            )
+        )
+        if len(recent_items) >= limit:
+            break
+
+    # --- Trending slices, using your existing fetch_trending helper ---
+    trending_localities = [
+        ent for ent in trending if ent.entity_type in ("city", "locality", "micromarket")
     ]
-
-    # 2) Existing trending logic (reuse whatever you already had)
-    #    Here I'm assuming you already have a helper like `get_trending_entities(...)`
-    #    that you used before for trending_searches.
-    trending_entities: List[EntityOut] = fetch_trending(es, city_id=city_id, limit=limit)
-
-    trending_localities: List[EntityOut] = [
-        e
-        for e in trending_entities
-        if e.entity_type in ("city", "locality", "micromarket")
-    ]
+    popular_entities = trending
 
     return ZeroStateResponse(
         city_id=city_id,
-        recent_searches=recent_searches,
-        trending_searches=trending_entities,
+        recent_searches=recent_items,
+        trending_searches=trending,
         trending_localities=trending_localities,
-        popular_entities=trending_entities,
+        popular_entities=popular_entities,
     )
 
 

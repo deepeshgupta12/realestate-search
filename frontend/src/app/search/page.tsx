@@ -1,213 +1,201 @@
-// frontend/src/app/search/page.tsx
-import Link from "next/link";
-import { apiGet } from "@/lib/api";
-import type { EntityOut, SuggestResponse } from "@/lib/types";
+import SearchBar from "@/components/SearchBar";
 
-type SP = Record<string, string | string[] | undefined>;
+type SearchParams = Record<string, string | string[] | undefined>;
 
-function first(v: string | string[] | undefined): string | undefined {
-  if (!v) return undefined;
-  return Array.isArray(v) ? v[0] : v;
-}
+type PageProps = {
+  searchParams: Promise<SearchParams>;
+};
 
-function enc(v: string): string {
-  return encodeURIComponent(v);
-}
-
-function makeQid(): string {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const g: any = globalThis as any;
-  if (g?.crypto?.randomUUID) return g.crypto.randomUUID();
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function buildGoHref(args: {
-  url: string;
-  qid: string;
-  entity: EntityOut;
-  rank: number;
+type SuggestItem = {
+  id: string;
+  entity_type: string;
+  name: string;
+  city?: string;
   city_id?: string;
-  context_url?: string;
-}) {
-  const { url, qid, entity, rank, city_id, context_url } = args;
+  parent_name?: string;
+  canonical_url: string;
+  score?: number | null;
+  popularity_score?: number | null;
+};
 
-  const qp: string[] = [];
-  qp.push(`url=${enc(url)}`);
-  qp.push(`qid=${enc(qid)}`);
-  qp.push(`entity_id=${enc(entity.id)}`);
-  qp.push(`entity_type=${enc(entity.entity_type)}`);
-  qp.push(`rank=${enc(String(rank))}`);
-
-  if (city_id) qp.push(`city_id=${enc(city_id)}`);
-  if (context_url) qp.push(`context_url=${enc(context_url)}`);
-
-  return `/go?${qp.join("&")}`;
-}
-
-function flattenGroups(groups: SuggestResponse["groups"]): EntityOut[] {
-  const out: EntityOut[] = [];
-  (groups.locations || []).forEach((x) => out.push(x));
-  (groups.projects || []).forEach((x) => out.push(x));
-  (groups.builders || []).forEach((x) => out.push(x));
-  (groups.rate_pages || []).forEach((x) => out.push(x));
-  (groups.property_pdps || []).forEach((x) => out.push(x));
-  return out;
-}
-
-function buildSerpHref(args: {
+type SuggestResponse = {
   q: string;
-  qid: string;
-  city_id?: string;
-  context_url?: string;
-}) {
-  const { q, qid, city_id, context_url } = args;
-  const qp: string[] = [];
-  qp.push(`q=${enc(q)}`);
-  qp.push(`qid=${enc(qid)}`);
-  if (city_id) qp.push(`city_id=${enc(city_id)}`);
-  if (context_url) qp.push(`context_url=${enc(context_url)}`);
-  return `/search?${qp.join("&")}`;
+  normalized_q: string;
+  did_you_mean: string | null;
+  groups: {
+    locations: SuggestItem[];
+    projects: SuggestItem[];
+    builders: SuggestItem[];
+    rate_pages: SuggestItem[];
+    property_pdps: SuggestItem[];
+  };
+  fallbacks?: {
+    relaxed_used: boolean;
+    trending: SuggestItem[];
+    reason: string | null;
+  };
+};
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+function sp1(v: string | string[] | undefined): string {
+  if (Array.isArray(v)) return (v[0] || "").trim();
+  return (v || "").trim();
 }
 
-export default async function SearchPage({
-  searchParams,
-}: {
-  searchParams: SP | Promise<SP>;
-}) {
-  const sp: SP =
-    typeof (searchParams as Promise<SP>)?.then === "function"
-      ? await (searchParams as Promise<SP>)
-      : (searchParams as SP);
+async function apiGet<T>(path: string, params: Record<string, string | undefined>): Promise<T> {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v && v.trim()) usp.set(k, v);
+  }
+  const url = `${API_BASE}${path}?${usp.toString()}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  return (await res.json()) as T;
+}
 
-  const q = (first(sp.q) || "").trim();
-  const city_id = first(sp.city_id) || undefined;
-  const context_url =
-    first(sp.context_url) || (q ? `/search?q=${enc(q)}` : "/search");
+function groupToSections(r: SuggestResponse): Array<{ title: string; items: SuggestItem[] }> {
+  const s: Array<{ title: string; items: SuggestItem[] }> = [];
+  if (r.groups.locations.length) s.push({ title: "Locations", items: r.groups.locations });
+  if (r.groups.projects.length) s.push({ title: "Projects", items: r.groups.projects });
+  if (r.groups.builders.length) s.push({ title: "Builders", items: r.groups.builders });
+  if (r.groups.rate_pages.length) s.push({ title: "Property Rates", items: r.groups.rate_pages });
+  if (r.groups.property_pdps.length) s.push({ title: "Properties", items: r.groups.property_pdps });
+  return s;
+}
 
-  const qid = first(sp.qid) || makeQid();
+export default async function SearchPage({ searchParams }: PageProps) {
+  const sp = await searchParams;
+
+  const q = sp1(sp?.q);
+  const city_id = sp1(sp?.city_id);
+  const qid = sp1(sp?.qid);
+  const context_url = sp1(sp?.context_url) || "/";
 
   if (!q) {
     return (
-      <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px" }}>
-        <h1 style={{ fontSize: 22, fontWeight: 700 }}>Search</h1>
-        <p style={{ opacity: 0.8 }}>Type in the search bar to see results.</p>
+      <main className="page">
+        <h1 className="h1">Search</h1>
+        <p className="sub">Type a query to see results.</p>
+        <SearchBar initialQ="" initialCityId={city_id} />
       </main>
     );
   }
 
   const data = await apiGet<SuggestResponse>("/api/v1/search", {
     q,
-    limit: 20,
-    ...(city_id ? { city_id } : {}),
+    city_id: city_id || undefined,
+    limit: "20",
   });
 
-  const all = flattenGroups(data.groups);
-  const hasAny = all.length > 0;
-
-  const dym =
-    (data.did_you_mean || "").trim() &&
-    data.did_you_mean!.trim().toLowerCase() !== q.toLowerCase()
-      ? data.did_you_mean!.trim()
-      : null;
+  const sections = groupToSections(data);
+  const total =
+    data.groups.locations.length +
+    data.groups.projects.length +
+    data.groups.builders.length +
+    data.groups.rate_pages.length +
+    data.groups.property_pdps.length;
 
   return (
-    <main style={{ maxWidth: 900, margin: "24px auto", padding: "0 16px" }}>
-      <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
-        <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>
-          Results for “{q}”
-        </h1>
-        <span style={{ opacity: 0.7, fontSize: 13 }}>qid: {qid}</span>
+    <main className="page">
+      <SearchBar initialQ={q} initialCityId={city_id} />
+
+      <div className="serpMeta">
+        Query: <strong>{q}</strong>
+        <br />
+        Results: <strong>{total}</strong>
+        {data.did_you_mean ? (
+          <>
+            <br />
+            Did you mean:{" "}
+            <a
+              className="link"
+              href={`/go?q=${encodeURIComponent(data.did_you_mean)}&city_id=${encodeURIComponent(
+                city_id || ""
+              )}&context_url=${encodeURIComponent(context_url)}`}
+            >
+              <strong>{data.did_you_mean}</strong>
+            </a>
+          </>
+        ) : null}
       </div>
 
-      {dym ? (
-        <div
-          style={{
-            marginTop: 12,
-            padding: 12,
-            border: "1px solid #eee",
-            borderRadius: 8,
-          }}
-        >
-          <span style={{ opacity: 0.85 }}>Did you mean </span>
-          <Link
-            href={buildSerpHref({ q: dym, qid, city_id, context_url })}
-            style={{ fontWeight: 700, textDecoration: "none" }}
-          >
-            {dym}
-          </Link>
-          <span style={{ opacity: 0.85 }}>?</span>
-        </div>
-      ) : null}
-
-      {!hasAny ? (
-        <>
-          <div style={{ marginTop: 14, padding: 12, border: "1px solid #eee" }}>
-            <div style={{ fontWeight: 700 }}>No results found</div>
-            <div style={{ opacity: 0.8, marginTop: 6 }}>
-              Try a different spelling, or explore trending.
-            </div>
+      {total === 0 ? (
+        <div className="card">
+          <div style={{ fontWeight: 700 }}>No results found</div>
+          <div style={{ color: "rgba(255,255,255,0.65)", marginTop: 6 }}>
+            Try a different query.
           </div>
-
-          {data.fallbacks?.trending?.length ? (
-            <>
-              <h2 style={{ marginTop: 18, fontSize: 16 }}>Trending</h2>
-              <ul style={{ marginTop: 8 }}>
-                {data.fallbacks.trending.map((e, i) => (
-                  <li key={e.id} style={{ margin: "8px 0" }}>
-                    <Link
-                      href={buildGoHref({
-                        url: e.canonical_url,
-                        qid,
-                        entity: e,
-                        rank: i + 1,
-                        city_id,
-                        context_url,
-                      })}
-                      style={{ textDecoration: "none" }}
-                    >
-                      <span style={{ fontWeight: 600 }}>{e.name}</span>{" "}
-                      <span style={{ opacity: 0.7 }}>
-                        ({e.entity_type}
-                        {e.city ? ` • ${e.city}` : ""})
-                      </span>
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : null}
-        </>
+        </div>
       ) : (
-        <>
-          <h2 style={{ marginTop: 18, fontSize: 16 }}>All matches</h2>
-          <ul style={{ marginTop: 8 }}>
-            {all.map((e, i) => (
-              <li key={e.id} style={{ margin: "10px 0" }}>
-                <Link
-                  href={buildGoHref({
-                    url: e.canonical_url,
-                    qid,
-                    entity: e,
-                    rank: i + 1,
-                    city_id,
-                    context_url,
-                  })}
-                  style={{ textDecoration: "none" }}
-                >
-                  <div style={{ fontWeight: 700 }}>{e.name}</div>
-                  <div style={{ opacity: 0.7, fontSize: 13 }}>
-                    {e.entity_type}
-                    {e.city ? ` • ${e.city}` : ""}
-                    {e.parent_name ? ` • ${e.parent_name}` : ""}
-                    {" • "}
-                    {e.canonical_url}
+        sections.map((sec) => (
+          <section key={sec.title}>
+            <div className="groupTitle">{sec.title}</div>
+            {sec.items.map((it, idx) => {
+              const rank = idx + 1;
+              const goHref =
+                `/go?url=${encodeURIComponent(it.canonical_url)}` +
+                `&qid=${encodeURIComponent(qid || "")}` +
+                `&q=${encodeURIComponent(q)}` +
+                `&entity_id=${encodeURIComponent(it.id)}` +
+                `&entity_type=${encodeURIComponent(it.entity_type)}` +
+                `&rank=${encodeURIComponent(String(rank))}` +
+                `&city_id=${encodeURIComponent((it.city_id || city_id || "").toString())}` +
+                `&context_url=${encodeURIComponent(context_url)}`;
+
+              return (
+                <div key={it.id} className="resultCard">
+                  <div style={{ fontWeight: 700 }}>{it.name}</div>
+                  <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                    {it.entity_type}
+                    {it.city ? ` • ${it.city}` : ""}
+                    {it.parent_name ? ` • ${it.parent_name}` : ""}
                   </div>
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </>
+                  <div style={{ marginTop: 8, fontSize: 13 }}>
+                    <a className="link" href={goHref}>
+                      Go to {it.canonical_url}
+                    </a>
+                  </div>
+                </div>
+              );
+            })}
+          </section>
+        ))
       )}
+
+      {data.fallbacks?.trending?.length ? (
+        <>
+          <div className="groupTitle">Trending</div>
+          {data.fallbacks.trending.map((it, idx) => {
+            const rank = idx + 1;
+            const goHref =
+              `/go?url=${encodeURIComponent(it.canonical_url)}` +
+              `&qid=${encodeURIComponent(qid || "")}` +
+              `&q=${encodeURIComponent(it.name)}` +
+              `&entity_id=${encodeURIComponent(it.id)}` +
+              `&entity_type=${encodeURIComponent(it.entity_type)}` +
+              `&rank=${encodeURIComponent(String(rank))}` +
+              `&city_id=${encodeURIComponent((it.city_id || "").toString())}` +
+              `&context_url=${encodeURIComponent(context_url)}`;
+
+            return (
+              <div key={it.id} className="resultCard">
+                <div style={{ fontWeight: 700 }}>{it.name}</div>
+                <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                  {it.entity_type}
+                  {it.city ? ` • ${it.city}` : ""}
+                  {it.parent_name ? ` • ${it.parent_name}` : ""}
+                </div>
+                <div style={{ marginTop: 8, fontSize: 13 }}>
+                  <a className="link" href={goHref}>
+                    Go to {it.canonical_url}
+                  </a>
+                </div>
+              </div>
+            );
+          })}
+        </>
+      ) : null}
     </main>
   );
 }
