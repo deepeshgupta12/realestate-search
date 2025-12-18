@@ -107,6 +107,17 @@ export default async function GoPage({ searchParams }: PageProps) {
   // Case 2: resolve query -> redirect to entity / serp / disambiguate
   if (!q) redirect("/");
 
+  // Log the search event BEFORE resolving/redirecting so that recents populate naturally.
+  // (We intentionally do NOT log for /go?url=... which is a click redirect.)
+  await postJson("/api/v1/events/search", {
+    query_id: qid,
+    raw_query: q,
+    normalized_query: q,
+    city_id: city_id || null,
+    context_url: context_url || null,
+    timestamp: new Date().toISOString(),
+  });
+
   const rr = await getResolve({
     q,
     city_id: city_id || undefined,
