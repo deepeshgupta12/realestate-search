@@ -1,5 +1,8 @@
 import { redirect } from "next/navigation";
 
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 type SearchParams = Record<string, string | string[] | undefined>;
 
 type PageProps = {
@@ -17,7 +20,11 @@ type ResolveResponse = {
   debug?: any;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+// Prefer a server env var; fallback to localhost backend
+const API_BASE =
+  process.env.API_BASE ||
+  process.env.NEXT_PUBLIC_API_BASE ||
+  "http://127.0.0.1:8000";
 
 function sp1(v: string | string[] | undefined): string {
   if (Array.isArray(v)) return (v[0] || "").trim();
@@ -33,7 +40,7 @@ function withParams(baseUrl: string, params: Record<string, string | null | unde
   return u.pathname + (u.search ? u.search : "");
 }
 
-/** V0 mapping (seed cities). Later this moves to config/DB. */
+/** V0 mapping (seed cities). Later this should move to config/DB. */
 const CITY_SLUG_TO_ID: Record<string, string> = {
   pune: "city_pune",
   noida: "city_noida",
@@ -67,21 +74,24 @@ function inferCityIdFromContextUrl(contextUrl: string): string | null {
   else if (!["search", "disambiguate", "go", "builders"].includes(seg[0])) citySlug = seg[0];
 
   if (!citySlug) return null;
-
-  const id = CITY_SLUG_TO_ID[citySlug.toLowerCase()];
-  return id || null;
+  return CITY_SLUG_TO_ID[citySlug.toLowerCase()] || null;
 }
 
 async function postJson(path: string, payload: any): Promise<void> {
   try {
-    await fetch(`${API_BASE}${path}`, {
+    const res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       cache: "no-store",
     });
-  } catch {
-    // swallow
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.error(`[go] POST ${path} failed: ${res.status} ${res.statusText}`, txt.slice(0, 300));
+    }
+  } catch (e: any) {
+    console.error(`[go] POST ${path} exception`, e?.message || e);
   }
 }
 
@@ -97,7 +107,8 @@ async function getResolve(params: Record<string, string | undefined>): Promise<R
     const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) return null;
     return (await res.json()) as ResolveResponse;
-  } catch {
+  } catch (e: any) {
+    console.error("[go] resolve exception", e?.message || e);
     return null;
   }
 }
@@ -111,18 +122,16 @@ export default async function GoPage({ searchParams }: PageProps) {
   const context_url = sp1(sp?.context_url) || "/";
   const city_id_param = sp1(sp?.city_id) || "";
 
-  // infer city if not passed
   const inferredCityId = city_id_param || inferCityIdFromContextUrl(context_url) || "";
-  const city_id = inferredCityId; // final city id used everywhere in this request
+  const city_id = inferredCityId;
 
-  // click logging inputs (optional)
   const qid = sp1(sp?.qid) || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
   const entity_id = sp1(sp?.entity_id) || "";
   const entity_type = sp1(sp?.entity_type) || "";
   const rankRaw = sp1(sp?.rank) || "";
   const rank = rankRaw ? Number(rankRaw) : null;
 
-  // Case 1: Direct URL redirect (used by SERP/disambiguate cards)
+  // 1) Direct URL redirects (SERP/disambiguate clicks) -> click event
   if (directUrl) {
     if (entity_id && entity_type && rank !== null) {
       await postJson("/api/v1/events/click", {
@@ -139,7 +148,7 @@ export default async function GoPage({ searchParams }: PageProps) {
     redirect(directUrl);
   }
 
-  // Case 2: resolve query -> redirect to entity / serp / disambiguate
+  // 2) Query resolves -> search event + resolve
   if (!q) redirect("/");
 
   // Log search BEFORE resolve so recents populate naturally
@@ -160,13 +169,14 @@ export default async function GoPage({ searchParams }: PageProps) {
   });
 
   if (!rr || !rr.url) {
-    const fallback = withParams("/search", {
-      q,
-      city_id: city_id || undefined,
-      qid,
-      context_url,
-    });
-    redirect(fallback);
+    redirect(
+      withParams("/search", {
+        q,
+        city_id: city_id || undefined,
+        qid,
+        context_url,
+      })
+    );
   }
 
   if (rr.action === "serp") {
