@@ -1,151 +1,140 @@
-"use client";
+import SearchBar from "@/components/SearchBar";
 
-import React, { useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-import { apiGet, apiPost } from "@/lib/api";
+type SearchParams = Record<string, string | string[] | undefined>;
 
-type EntityOut = {
+type PageProps = {
+  searchParams: Promise<SearchParams>;
+};
+
+type SuggestItem = {
   id: string;
   entity_type: string;
   name: string;
-  city?: string | null;
-  city_id?: string | null;
-  parent_name?: string | null;
+  city?: string;
+  city_id?: string;
+  parent_name?: string;
   canonical_url: string;
   score?: number | null;
   popularity_score?: number | null;
 };
 
-type ResolveResponse = {
-  action: "redirect" | "serp" | "disambiguate";
-  query: string;
-  normalized_query: string;
-  url: string | null;
-  candidates?: EntityOut[] | null;
-  reason?: string | null;
-  debug?: any;
+type SuggestResponse = {
+  q: string;
+  normalized_q: string;
+  did_you_mean: string | null;
+  groups: {
+    locations: SuggestItem[];
+    projects: SuggestItem[];
+    builders: SuggestItem[];
+    rate_pages: SuggestItem[];
+    property_pdps: SuggestItem[];
+  };
+  fallbacks?: any;
 };
 
-function sp1(v: string | null): string {
-  return v ?? "";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+function sp1(v: string | string[] | undefined): string {
+  if (Array.isArray(v)) return (v[0] || "").trim();
+  return (v || "").trim();
 }
 
-function ensureLeadingSlash(u: string): string {
-  if (!u) return "/";
-  return u.startsWith("/") ? u : `/${u}`;
+async function apiGet<T>(path: string, params: Record<string, string | undefined>): Promise<T> {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v && v.trim()) usp.set(k, v);
+  }
+  const url = `${API_BASE}${path}?${usp.toString()}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  return (await res.json()) as T;
 }
 
-export default function DisambiguatePage() {
-  const router = useRouter();
-  const sp = useSearchParams();
+export default async function DisambiguatePage({ searchParams }: PageProps) {
+  const sp = await searchParams;
 
-  const q = sp1(sp.get("q"));
-  const qid = sp1(sp.get("qid"));
-  const city_id_param = sp1(sp.get("city_id")) || null;
-  const context_url = sp1(sp.get("context_url")) || "/";
+  const q = sp1(sp?.q);
+  const qid = sp1(sp?.qid);
+  const city_id = sp1(sp?.city_id);
+  const context_url = sp1(sp?.context_url) || "/";
 
-  const [loading, setLoading] = useState(true);
-  const [candidates, setCandidates] = useState<EntityOut[]>([]);
-  const [err, setErr] = useState<string | null>(null);
-
-  const title = useMemo(() => {
-    if (!q) return "Choose one";
-    return `Which “${q}” did you mean?`;
-  }, [q]);
-
-  useEffect(() => {
-    async function run() {
-      setLoading(true);
-      setErr(null);
-      try {
-        const path =
-          `/search/resolve?q=${encodeURIComponent(q)}` +
-          (city_id_param ? `&city_id=${encodeURIComponent(city_id_param)}` : "") +
-          `&context_url=${encodeURIComponent(context_url)}`;
-        const res = await apiGet<ResolveResponse>(path);
-
-        if (res.action === "redirect" && res.url) {
-          router.replace(ensureLeadingSlash(res.url));
-          return;
-        }
-
-        setCandidates(res.candidates || []);
-      } catch (e: any) {
-        setErr(e?.message || "Failed to load disambiguation options");
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    if (!q) {
-      setLoading(false);
-      setCandidates([]);
-      return;
-    }
-
-    run();
-  }, [q, city_id_param, context_url, router]);
-
-  async function onPick(it: EntityOut, idx: number) {
-    // CLICK LOG MUST include city_id: prefer entity city_id > page city_id
-    const city_id = (it.city_id || city_id_param || null) as string | null;
-
-    if (qid) {
-      await apiPost("/events/click", {
-        query_id: qid,
-        entity_id: it.id,
-        entity_type: it.entity_type,
-        rank: idx + 1,
-        url: ensureLeadingSlash(it.canonical_url),
-        city_id,
-        context_url,
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    router.push(ensureLeadingSlash(it.canonical_url));
+  if (!q) {
+    return (
+      <main className="page">
+        <h1 className="h1">Disambiguate</h1>
+        <p className="sub">Missing query.</p>
+        <SearchBar initialQ="" initialCityId={city_id} />
+      </main>
+    );
   }
 
+  // We intentionally call suggest (not resolve) so we don't double-log "search"
+  const data = await apiGet<SuggestResponse>("/api/v1/search/suggest", {
+    q,
+    limit: "20",
+    city_id: city_id || undefined,
+  });
+
+  // Candidates for disambiguation: in practice, this is almost always locations
+  const candidates: SuggestItem[] = data.groups.locations.length
+    ? data.groups.locations
+    : [
+        ...data.groups.projects,
+        ...data.groups.builders,
+        ...data.groups.rate_pages,
+        ...data.groups.property_pdps,
+      ];
+
   return (
-    <div className="mx-auto max-w-2xl px-4 py-10">
-      <h1 className="text-xl font-semibold">{title}</h1>
-      <p className="mt-1 text-sm text-gray-600">
-        Select the correct location/project to continue.
-      </p>
+    <main className="page">
+      <SearchBar initialQ={q} initialCityId={city_id} />
 
-      {loading && <div className="mt-6 text-sm text-gray-600">Loading…</div>}
+      <div className="serpMeta">
+        Multiple matches for <strong>{q}</strong>. Pick the right one.
+      </div>
 
-      {!loading && err && (
-        <div className="mt-6 rounded-lg border bg-red-50 px-4 py-3 text-sm text-red-700">
-          {err}
+      {candidates.length === 0 ? (
+        <div className="card">
+          <div style={{ fontWeight: 700 }}>No candidates found</div>
+          <div style={{ color: "rgba(255,255,255,0.65)", marginTop: 6 }}>
+            Try searching again.
+          </div>
         </div>
-      )}
+      ) : (
+        <section>
+          <div className="groupTitle">Choose one</div>
 
-      {!loading && !err && candidates.length === 0 && (
-        <div className="mt-6 rounded-lg border bg-gray-50 px-4 py-3 text-sm text-gray-700">
-          No disambiguation options found. Try searching again.
-        </div>
-      )}
+          {candidates.map((it, idx) => {
+            const rank = idx + 1;
+            const goHref =
+              `/go?url=${encodeURIComponent(it.canonical_url)}` +
+              `&qid=${encodeURIComponent(qid || "")}` +
+              `&q=${encodeURIComponent(q)}` +
+              `&entity_id=${encodeURIComponent(it.id)}` +
+              `&entity_type=${encodeURIComponent(it.entity_type)}` +
+              `&rank=${encodeURIComponent(String(rank))}` +
+              `&city_id=${encodeURIComponent((it.city_id || city_id || "").toString())}` +
+              `&context_url=${encodeURIComponent(context_url)}`;
 
-      {!loading && !err && candidates.length > 0 && (
-        <div className="mt-6 space-y-2">
-          {candidates.map((it, idx) => (
-            <button
-              key={`${it.id}_${idx}`}
-              onClick={() => void onPick(it, idx)}
-              className="w-full rounded-xl border px-4 py-3 text-left hover:bg-gray-50"
-              type="button"
-            >
-              <div className="font-medium">{it.name}</div>
-              <div className="mt-0.5 text-xs text-gray-600">
-                {it.city ? it.city : "—"}
-                {it.parent_name ? ` • ${it.parent_name}` : ""}
+            return (
+              <div key={it.id} className="resultCard">
+                <div style={{ fontWeight: 700 }}>{it.name}</div>
+                <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
+                  {it.entity_type}
+                  {it.city ? ` • ${it.city}` : ""}
+                  {it.parent_name ? ` • ${it.parent_name}` : ""}
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 13 }}>
+                  <a className="link" href={goHref}>
+                    Go to {it.canonical_url}
+                  </a>
+                </div>
               </div>
-              <div className="mt-1 text-xs text-gray-400">{it.canonical_url}</div>
-            </button>
-          ))}
-        </div>
+            );
+          })}
+        </section>
       )}
-    </div>
+    </main>
   );
 }
