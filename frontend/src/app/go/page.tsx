@@ -12,7 +12,6 @@ type ResolveResponse = {
   normalized_query: string;
   url: string | null;
   reason: string;
-  // optional fields (safe if backend includes them)
   match?: any;
   candidates?: any[] | null;
   debug?: any;
@@ -31,22 +30,56 @@ function withParams(baseUrl: string, params: Record<string, string | null | unde
     if (val === undefined || val === null || String(val).trim() === "") continue;
     if (!u.searchParams.has(k)) u.searchParams.set(k, String(val));
   }
-  const out = u.pathname + (u.search ? u.search : "");
-  return out;
+  return u.pathname + (u.search ? u.search : "");
+}
+
+/** V0 mapping (seed cities). Later this moves to config/DB. */
+const CITY_SLUG_TO_ID: Record<string, string> = {
+  pune: "city_pune",
+  noida: "city_noida",
+};
+
+function inferCityIdFromContextUrl(contextUrl: string): string | null {
+  if (!contextUrl) return null;
+
+  let path = contextUrl.trim();
+
+  // allow clean urls OR full urls
+  try {
+    if (path.startsWith("http://") || path.startsWith("https://")) {
+      const u = new URL(path);
+      path = u.pathname || "/";
+    }
+  } catch {
+    // ignore
+  }
+
+  const seg = path.split("?")[0].split("#")[0].split("/").filter(Boolean);
+  if (seg.length === 0) return null;
+
+  let citySlug: string | null = null;
+
+  // /property-rates/<city>/...
+  if (seg[0] === "property-rates" && seg[1]) citySlug = seg[1];
+  // /projects/<city>/...
+  else if (seg[0] === "projects" && seg[1]) citySlug = seg[1];
+  // /<city>/...
+  else if (!["search", "disambiguate", "go", "builders"].includes(seg[0])) citySlug = seg[0];
+
+  if (!citySlug) return null;
+
+  const id = CITY_SLUG_TO_ID[citySlug.toLowerCase()];
+  return id || null;
 }
 
 async function postJson(path: string, payload: any): Promise<void> {
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
+    await fetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       cache: "no-store",
     });
-    // Don’t block navigation if logging fails
-    if (!res.ok) {
-      // swallow
-    }
   } catch {
     // swallow
   }
@@ -75,8 +108,12 @@ export default async function GoPage({ searchParams }: PageProps) {
   const q = sp1(sp?.q);
   const directUrl = sp1(sp?.url);
 
-  const city_id = sp1(sp?.city_id) || "";
   const context_url = sp1(sp?.context_url) || "/";
+  const city_id_param = sp1(sp?.city_id) || "";
+
+  // infer city if not passed
+  const inferredCityId = city_id_param || inferCityIdFromContextUrl(context_url) || "";
+  const city_id = inferredCityId; // final city id used everywhere in this request
 
   // click logging inputs (optional)
   const qid = sp1(sp?.qid) || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
@@ -87,7 +124,6 @@ export default async function GoPage({ searchParams }: PageProps) {
 
   // Case 1: Direct URL redirect (used by SERP/disambiguate cards)
   if (directUrl) {
-    // log click if we have enough info
     if (entity_id && entity_type && rank !== null) {
       await postJson("/api/v1/events/click", {
         query_id: qid,
@@ -100,15 +136,13 @@ export default async function GoPage({ searchParams }: PageProps) {
         timestamp: new Date().toISOString(),
       });
     }
-
     redirect(directUrl);
   }
 
   // Case 2: resolve query -> redirect to entity / serp / disambiguate
   if (!q) redirect("/");
 
-  // Log the search event BEFORE resolving/redirecting so that recents populate naturally.
-  // (We intentionally do NOT log for /go?url=... which is a click redirect.)
+  // Log search BEFORE resolve so recents populate naturally
   await postJson("/api/v1/events/search", {
     query_id: qid,
     raw_query: q,
@@ -122,10 +156,9 @@ export default async function GoPage({ searchParams }: PageProps) {
     q,
     city_id: city_id || undefined,
     context_url: context_url || undefined,
-    qid, // backend may ignore; safe
+    qid,
   });
 
-  // If backend fails, fallback to SERP
   if (!rr || !rr.url) {
     const fallback = withParams("/search", {
       q,
@@ -136,31 +169,32 @@ export default async function GoPage({ searchParams }: PageProps) {
     redirect(fallback);
   }
 
-  // Ensure qid + context_url survive the redirect (important for click logging later)
   if (rr.action === "serp") {
-    const serpUrl = withParams(rr.url, {
-      qid,
-      context_url,
-      city_id: city_id || undefined,
-    });
-    redirect(serpUrl);
+    redirect(
+      withParams(rr.url, {
+        qid,
+        context_url,
+        city_id: city_id || undefined,
+      })
+    );
   }
 
   if (rr.action === "disambiguate") {
-    const disUrl = withParams("/disambiguate", {
-      q,
+    redirect(
+      withParams("/disambiguate", {
+        q,
+        qid,
+        context_url,
+        city_id: city_id || undefined,
+      })
+    );
+  }
+
+  redirect(
+    withParams(rr.url, {
       qid,
       context_url,
       city_id: city_id || undefined,
-    });
-    redirect(disUrl);
-  }
-
-  // redirect action
-  const redUrl = withParams(rr.url, {
-    qid,
-    context_url,
-    city_id: city_id || undefined,
-  });
-  redirect(redUrl);
+    })
+  );
 }
