@@ -913,19 +913,26 @@ def resolve(
     same_name = [e for e in entities if normalize_q(e.name) == normalize_q(top.name) and e.entity_type == top.entity_type]
     cities = sorted({e.city_id for e in same_name if e.city_id})
 
-    if len(same_name) > 1 and len(cities) > 1:
-        if city_id:
-            scoped = [e for e in same_name if e.city_id == city_id]
-            if len(scoped) == 1:
-                return ResolveResponse(
-                    action="redirect",
-                    query=raw_q,
-                    normalized_query=normalize_q(raw_q),
-                    url=scoped[0].canonical_url,
-                    match=scoped[0],
-                    reason="city_scoped_same_name",
-                    debug={"city_id": city_id, "candidate_count": len(same_name), "cities": cities},
-                )
+    # City preference: if we have city context, prefer the best matching-city entity
+    # even when the global score-gap heuristic would call it "ambiguous".
+    if city_id:
+        # Prefer an entity in the requested city with same normalized name as the query
+        qn = normalize_q(raw_q)
+        same_q = [e for e in entities if normalize_q(e.name) == qn]
+        scoped_same_q = [e for e in same_q if e.city_id == city_id]
+
+        if scoped_same_q:
+            # Pick the highest scored among scoped candidates (they already carry ES score)
+            scoped_best = sorted(scoped_same_q, key=lambda x: (x.score or 0.0), reverse=True)[0]
+            return ResolveResponse(
+                action="redirect",
+                query=raw_q,
+                normalized_query=normalize_q(raw_q),
+                url=scoped_best.canonical_url,
+                match=scoped_best,
+                reason="city_scoped_prefer_exact_name",
+                debug={"city_id": city_id, "picked": scoped_best.id, "picked_score": scoped_best.score},
+            )
 
         return ResolveResponse(
             action="disambiguate",
