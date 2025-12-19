@@ -304,6 +304,12 @@ def parse_query(q: str) -> ParseResponse:
         if m:
             builder_hint = m.group(1).strip()
 
+        # Example: "dlf 2 bhk in baner under 1 cr" -> builder_hint="dlf"
+    if not builder_hint:
+        m = re.search(r"^([a-z0-9&.\- ]+?)\s+(?:[1-6]\s*bhk\b|bhk\b|in\b|near\b|at\b|under\b|below\b|between\b|rent\b|buy\b|sale\b|resale\b)", s)
+        if m:
+            builder_hint = m.group(1).strip()
+
     # ------------------
     # Location hint ("in Baner", "near Baner", "at Baner")
     # ------------------
@@ -1169,6 +1175,14 @@ def resolve(
                     scoped = [c for c in candidates if c.city_id == city_id]
                     if len(scoped) == 1:
                         listing_url = build_listing_url(scoped[0], parsed)
+                        if getattr(parsed, "builder_hint", None):
+                            bhits, _ = es_search_entities(q=parsed.builder_hint, limit=5, entity_types=["builder"])
+                            builders = [hit_to_entity(h) for h in bhits]
+                            if builders:
+                                bkey = normalize_q(parsed.builder_hint)
+                                exact = [b for b in builders if normalize_q(b.name) == bkey]
+                                b = (exact or builders)[0]
+                                listing_url += ("&" if "?" in listing_url else "?") + f"builder_id={b.id}"
                         return ResolveResponse(
                             action="redirect",
                             query=raw_q,
