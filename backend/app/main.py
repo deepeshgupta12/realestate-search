@@ -759,32 +759,6 @@ def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
 
     params={}
 
-    # ---------- NEW: project -> city-scoped listing path ----------
-    # Project canonical is like: /projects/<city_slug>/<project-slug>
-    if entity.entity_type == "project":
-        city_slug = None
-        m = re.match(r"^/projects/([^/]+)/", base)
-        if m:
-            city_slug = m.group(1)
-
-        # fallback if canonical doesn't match expected pattern
-        if not city_slug:
-            city_slug = (entity.city or "").strip().lower()
-            city_slug = re.sub(r"[^a-z0-9]+", "-", city_slug).strip("-") if city_slug else None
-
-        # safe fallback: if we still can't infer city, just return the canonical
-        if not city_slug:
-            return base
-
-        base_with_intent = f"/{city_slug}/{segment}"
-    # ---------- existing behavior for location-like entities ----------
-    elif entity.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview"):
-        base_with_intent = f"{base}/{segment}" if base != "/" else f"/{segment}"
-    else:
-        base_with_intent = base
-
-    params = {}
-
 # ----------------------------
     # V1.x: project + constraints
     # Route to city listing + project_id
@@ -843,6 +817,27 @@ def slugify(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return re.sub(r"-{2,}", "-", s).strip("-")
+
+def _pick_best_scoped(scoped: List[EntityOut], parsed: ParseResponse, location_q: str) -> EntityOut:
+    # Heuristic:
+    # 1) If query looks project-ish AND a project exists, prefer project
+    # 2) Else prefer locality/micromarket/city over project
+    loc_key = normalize_q(location_q or "")
+
+    # Exact-name projects (common for "godrej woods", "eldico ...", etc.)
+    proj_exact = [e for e in scoped if e.entity_type == "project" and normalize_q(e.name) == loc_key]
+    if proj_exact:
+        # If it’s multi-word, very likely a project name
+        if len(loc_key.split()) >= 2:
+            return proj_exact[0]
+        # If query has resale/rent/bhk/budget etc, treat as inventory intent → project listing
+        if parsed.intent or parsed.bhk or parsed.min_price or parsed.max_price or parsed.min_rent or parsed.max_rent or parsed.status or parsed.property_type:
+            return proj_exact[0]
+
+    # Otherwise, prefer geo locations first
+    priority = {"locality": 1, "micromarket": 2, "city": 3, "listing_page": 4, "locality_overview": 5, "project": 6}
+    scoped_sorted = sorted(scoped, key=lambda e: priority.get(e.entity_type, 99))
+    return scoped_sorted[0]
 
 # -----------------------
 # App + Routers
@@ -1296,17 +1291,20 @@ def resolve(
 
     if len(same_name) > 1 and len(cities) > 1:
         if city_id:
-            scoped = [e for e in same_name if e.city_id == city_id]
-            if len(scoped) == 1:
-                return ResolveResponse(
-                    action="redirect",
-                    query=raw_q,
-                    normalized_query=normalize_q(raw_q),
-                    url=scoped[0].canonical_url,
-                    match=scoped[0],
-                    reason="city_scoped_same_name",
-                    debug={"city_id": city_id, "candidate_count": len(same_name)},
-                )
+            scoped = [c for c in candidates if c.city_id == city_id]
+            if scoped:
+                picked = scoped[0] if len(scoped) == 1 else _pick_best_scoped(scoped, parsed, location_q)
+                listing_url = build_listing_url(picked, parsed)
+            
+            return ResolveResponse(
+                action="redirect",
+                query=raw_q,
+                normalized_query=normalize_q(raw_q),
+                url=listing_url,
+                match=picked,
+                reason="constraint_heavy_city_scoped_listing",
+                debug={"city_id": city_id, "base": picked.canonical_url, "picked": picked.id, "scoped_count": len(scoped)},
+            )
 
         return ResolveResponse(
             action="disambiguate",
