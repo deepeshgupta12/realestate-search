@@ -77,6 +77,34 @@ function inferCityIdFromContextUrl(contextUrl: string): string | null {
   return CITY_SLUG_TO_ID[citySlug.toLowerCase()] || null;
 }
 
+async function inferCityIdFromSlugViaSuggest(citySlug: string): Promise<string | null> {
+  if (!citySlug) return null;
+
+  const url = `${API_BASE}/api/v1/search/suggest?q=${encodeURIComponent(citySlug)}&limit=5&context_url=/`;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+
+    const locs: any[] = data?.groups?.locations || [];
+    const city = locs.find((x) => x?.entity_type === "city");
+    return city?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+function extractCitySlugFromContextUrl(contextUrl: string): string | null {
+  const seg = (contextUrl || "/").split("?")[0].split("#")[0].split("/").filter(Boolean);
+  if (seg.length === 0) return null;
+
+  if (seg[0] === "property-rates" && seg[1]) return seg[1];
+  if (seg[0] === "projects" && seg[1]) return seg[1];
+  if (!["search", "disambiguate", "go", "builders"].includes(seg[0])) return seg[0];
+
+  return null;
+}
+
 async function postJson(path: string, payload: any): Promise<void> {
   try {
     const res = await fetch(`${API_BASE}${path}`, {
@@ -120,10 +148,17 @@ export default async function GoPage({ searchParams }: PageProps) {
   const directUrl = sp1(sp?.url);
 
   const context_url = sp1(sp?.context_url) || "/";
-  const city_id_param = sp1(sp?.city_id) || "";
 
-  const inferredCityId = city_id_param || inferCityIdFromContextUrl(context_url) || "";
-  const city_id = inferredCityId;
+  const city_id_param = sp1(sp?.city_id) || "";
+  let city_id = city_id_param;
+
+  if (!city_id) {
+    const slug = extractCitySlugFromContextUrl(context_url);
+  if (slug) {
+    const inferred = await inferCityIdFromSlugViaSuggest(slug);
+  if (inferred) city_id = inferred;
+  }
+}
 
   const qid = sp1(sp?.qid) || (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`);
   const entity_id = sp1(sp?.entity_id) || "";
