@@ -36,7 +36,10 @@ type SuggestResponse = {
   };
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const API_BASE =
+  process.env.API_BASE ||
+  process.env.NEXT_PUBLIC_API_BASE ||
+  "http://localhost:8000";
 
 function sp1(v: string | string[] | undefined): string {
   if (Array.isArray(v)) return (v[0] || "").trim();
