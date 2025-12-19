@@ -56,6 +56,9 @@ CLICK_EVENTS_FILE = EVENTS_DIR / "click.jsonl"
 
 # Resolver thresholds (demo-tuned)
 MIN_REDIRECT_SCORE = float(os.getenv("MIN_REDIRECT_SCORE", "5.0"))
+CITY_REDIRECT_MIN_SCORE = float(os.getenv("CITY_REDIRECT_MIN_SCORE", "2.5"))
+CITY_REDIRECT_MIN_GAP = float(os.getenv("CITY_REDIRECT_MIN_GAP", "0.05"))
+CITY_REDIRECT_SECOND_REL_MAX = float(os.getenv("CITY_REDIRECT_SECOND_REL_MAX", "0.92"))
 MIN_REDIRECT_GAP = float(os.getenv("MIN_REDIRECT_GAP", "0.30"))
 
 
@@ -436,45 +439,89 @@ def seed_docs() -> List[Dict[str, Any]]:
     ]
 
 
-def es_search_entities(q: str, limit: int, city_id: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def es_search_entities(
+    q: str, limit: int, city_id: Optional[str]
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Elastic search helper used by /suggest, /search, /resolve.
+
+    City behavior:
+    - If city_id is present, we filter to (city_id == city_id) OR (city_id == "")
+      so global entities (e.g. builders) are still eligible.
+    - We also add a scoring boost for city_id matches, which helps ordering.
+    """
     nq = normalize_q(q)
 
-    must: List[Dict[str, Any]] = []
-    if city_id:
-        must.append({"term": {"city_id": city_id}})
+    should: List[Dict[str, Any]] = [
+        {
+            "match_phrase_prefix": {
+                "name": {"query": q, "slop": 2, "max_expansions": 50}
+            }
+        },
+        {"match": {"name": {"query": q, "fuzziness": "AUTO"}}},
+        {"term": {"name_norm": {"value": nq, "boost": 4.0}}},
+    ]
 
-    body: Dict[str, Any] = {
+    filter_clauses: List[Dict[str, Any]] = []
+
+    if city_id:
+        # allow city-specific + global entities
+        filter_clauses.append(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"city_id": city_id}},
+                        {"term": {"city_id": ""}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
+        # scoring boost for exact city match
+        should.append({"term": {"city_id": {"value": city_id, "boost": 2.5}}})
+
+    body = {
         "size": limit,
         "query": {
             "bool": {
-                "must": must,
-                "should": [
-                    {"match_phrase_prefix": {"name": {"query": q, "slop": 2}}},
-                    {"match": {"name": {"query": q, "fuzziness": "AUTO"}}},
-                    {"term": {"name_norm": nq}},
-                ],
+                "filter": filter_clauses,
+                "should": should,
                 "minimum_should_match": 1,
             }
         },
+        "sort": [
+            {"_score": {"order": "desc"}},
+            {"popularity_score": {"order": "desc", "missing": 0}},
+        ],
         "suggest": {
             "did_you_mean": {
                 "text": q,
-                "term": {"field": "name"}
+                "term": {
+                    "field": "name",
+                    "suggest_mode": "popular",
+                    "min_word_length": 3,
+                },
             }
-        }
+        },
     }
 
     res = es.search(index=INDEX_NAME, body=body)
     hits = res.get("hits", {}).get("hits", [])
-    sugg = None
-    try:
-        opts = res.get("suggest", {}).get("did_you_mean", [])[0].get("options", [])
-        if opts:
-            sugg = opts[0].get("text")
-    except Exception:
-        sugg = None
 
-    return hits, sugg
+    # did-you-mean
+    did_you_mean = None
+    try:
+        options = (
+            res.get("suggest", {})
+            .get("did_you_mean", [])[0]
+            .get("options", [])
+        )
+        if options:
+            did_you_mean = options[0].get("text")
+    except Exception:
+        pass
+
+    return hits, did_you_mean
 
 
 def es_lookup_by_canonical_url(path: str) -> Optional[Dict[str, Any]]:
@@ -819,7 +866,12 @@ def resolve(
 
             entities = [hit_to_entity(h) for h in hits]
             # Restrict to locations only
-            locs = [e for e in entities if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview")]
+            locs = [
+                e
+                for e in entities
+                if e.entity_type
+                in ("city", "micromarket", "locality", "listing_page", "locality_overview")
+            ]
 
             # If multiple same-name locations across cities and city_id not provided -> disambiguate
             if locs:
@@ -882,6 +934,13 @@ def resolve(
 
     # Normal resolver (no constraints)
     hits, _ = es_search_entities(q=raw_q, limit=10, city_id=city_id)
+    debug: Dict[str, Any] = {}
+
+    # If city-scoped search returns nothing, retry globally (helps when city context is wrong)
+    if not hits and city_id:
+        debug["city_fallback_used"] = True
+        hits, _ = es_search_entities(q=raw_q, limit=10, city_id=None)
+
     if not hits:
         return ResolveResponse(
             action="serp",
@@ -889,13 +948,18 @@ def resolve(
             normalized_query=raw_q,
             url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
             reason="no_results",
+            debug=debug or None,
         )
 
     entities = [hit_to_entity(h) for h in hits]
 
     # same-name disambiguation (2.4A/2.4C)
     top = entities[0]
-    same_name = [e for e in entities if normalize_q(e.name) == normalize_q(top.name) and e.entity_type == top.entity_type]
+    same_name = [
+        e
+        for e in entities
+        if normalize_q(e.name) == normalize_q(top.name) and e.entity_type == top.entity_type
+    ]
     cities = sorted({e.city_id for e in same_name if e.city_id})
 
     if len(same_name) > 1 and len(cities) > 1:
@@ -909,7 +973,7 @@ def resolve(
                     url=scoped[0].canonical_url,
                     match=scoped[0],
                     reason="city_scoped_same_name",
-                    debug={"city_id": city_id, "candidate_count": len(same_name)},
+                    debug={"city_id": city_id, "candidate_count": len(same_name), **debug},
                 )
 
         return ResolveResponse(
@@ -918,7 +982,7 @@ def resolve(
             normalized_query=normalize_q(raw_q),
             candidates=same_name[:10],
             reason="same_name",
-            debug={"candidate_count": len(same_name), "cities": cities},
+            debug={"candidate_count": len(same_name), "cities": cities, **debug},
         )
 
     # score-gap heuristic
@@ -927,8 +991,37 @@ def resolve(
     top_score = float(top_hit.get("_score") or 0.0)
     second_score = float(second_hit.get("_score") or 0.0) if second_hit else 0.0
     gap = 1.0 if top_score <= 0 else (top_score - second_score) / max(top_score, 1e-9)
+    second_rel = 0.0 if top_score <= 0 else (second_score / max(top_score, 1e-9))
 
     match = hit_to_entity(top_hit)
+
+    # City context: relax redirect thresholds a bit (reduces unnecessary SERP when city is known)
+    if city_id and match.city_id == city_id:
+        debug.update(
+            {
+                "city_scoped": True,
+                "top_score": top_score,
+                "second_score": second_score,
+                "gap": gap,
+                "second_rel": second_rel,
+            }
+        )
+
+        if top_score >= CITY_REDIRECT_MIN_SCORE and (
+            gap >= CITY_REDIRECT_MIN_GAP or second_rel <= CITY_REDIRECT_SECOND_REL_MAX
+        ):
+            return ResolveResponse(
+                action="redirect",
+                query=raw_q,
+                normalized_query=normalize_q(raw_q),
+                url=match.canonical_url,
+                match=match,
+                reason="city_scoped_relaxed_redirect",
+                debug=debug,
+            )
+
+    # Default confident redirect
+    debug.update({"top_score": top_score, "second_score": second_score, "gap": gap})
     if top_score >= MIN_REDIRECT_SCORE and gap >= MIN_REDIRECT_GAP:
         return ResolveResponse(
             action="redirect",
@@ -937,16 +1030,16 @@ def resolve(
             url=match.canonical_url,
             match=match,
             reason="confident_redirect",
-            debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+            debug=debug,
         )
 
     return ResolveResponse(
         action="serp",
         query=raw_q,
-        normalized_query=normalize_q(raw_q),
+        normalized_query=raw_q,
         url=build_serp_url(raw_q, city_id=city_id, qid=None, context_url=context_url),
         reason="ambiguous",
-        debug={"top_score": top_score, "second_score": second_score, "gap": gap},
+        debug=debug,
     )
 
 
