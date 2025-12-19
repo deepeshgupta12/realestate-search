@@ -757,12 +757,40 @@ def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
     intent = (getattr(parsed, "intent", None) or "").strip().lower()
     segment = "rent" if intent == "rent" else "buy"
 
-    if entity.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview"):
+    # ---------- NEW: project -> city-scoped listing path ----------
+    # Project canonical is like: /projects/<city_slug>/<project-slug>
+    if entity.entity_type == "project":
+        city_slug = None
+        m = re.match(r"^/projects/([^/]+)/", base)
+        if m:
+            city_slug = m.group(1)
+
+        # fallback if canonical doesn't match expected pattern
+        if not city_slug:
+            city_slug = (entity.city or "").strip().lower()
+            city_slug = re.sub(r"[^a-z0-9]+", "-", city_slug).strip("-") if city_slug else None
+
+        # safe fallback: if we still can't infer city, just return the canonical
+        if not city_slug:
+            return base
+
+        base_with_intent = f"/{city_slug}/{segment}"
+    # ---------- existing behavior for location-like entities ----------
+    elif entity.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview"):
         base_with_intent = f"{base}/{segment}" if base != "/" else f"/{segment}"
     else:
         base_with_intent = base
 
     params = {}
+
+    # NEW: attach project_id when routing via project listing path
+    if entity.entity_type == "project":
+        params["project_id"] = entity.id
+
+    # if your ParseResponse stores builder_id (from v1.3b), include it
+    builder_id = getattr(parsed, "builder_id", None)
+    if builder_id:
+        params["builder_id"] = builder_id
 
     bhk = getattr(parsed, "bhk", None)
     if bhk is not None:
@@ -792,6 +820,12 @@ def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
 
     qs = urlencode(params)
     return base_with_intent + (f"?{qs}" if qs else "")
+
+
+def slugify(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return re.sub(r"-{2,}", "-", s).strip("-")
 
 # -----------------------
 # App + Routers
@@ -1145,8 +1179,18 @@ def resolve(
             hits, _ = es_search_entities(q=location_q, limit=10, city_id=city_id)
 
             entities = [hit_to_entity(h) for h in hits]
-            # Restrict to locations only
-            locs = [e for e in entities if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview")]
+            # Restrict to location-like + project (so we can route "project + constraints" to listing)
+            locs = [
+                e for e in entities
+                if e.entity_type in (
+                    "city",
+                    "micromarket",
+                    "locality",
+                    "listing_page",
+                    "locality_overview",
+                    "project",  # ✅ add this
+                    )
+                ]
 
             # If multiple same-name locations across cities and city_id not provided -> disambiguate
             if locs:
