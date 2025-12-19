@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 
-# IMPORTANT: reuse the same log path used by the event writer (store.py)
+# Single source of truth for the log path (uses BASE_DIR/.events, not CWD)
 from .store import SEARCH_LOG as SEARCH_LOG_PATH
 
 
@@ -18,7 +18,7 @@ class RecentQuery:
     normalized_query: str
     city_id: Optional[str] = None
     context_url: Optional[str] = None
-    timestamp: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO string
 
 
 def _iter_log_lines(path: Path) -> Iterable[str]:
@@ -37,11 +37,12 @@ def load_recent_queries(
     limit: int = 8,
     log_path: Optional[Path] = None,
 ) -> List[RecentQuery]:
-    """Load deduplicated recent queries from the search events log.
+    """
+    Load deduplicated recent queries from the search events log.
 
-    - Reads from backend/.events/search.jsonl (same as event writer)
+    - Reads from <repo>/backend/.events/search.jsonl (via store.SEARCH_LOG)
     - Returns at most `limit` RecentQuery objects
-    - Dedupes by (normalized_query, city_id)
+    - Dedupes by (normalized_query.lower(), city_id)
     - If `city_id` is provided, filters only that city
     """
     path = log_path or SEARCH_LOG_PATH
@@ -96,5 +97,5 @@ def load_recent_searches(
     limit: int = 8,
     log_path: Optional[Path] = None,
 ) -> List[RecentQuery]:
-    """Alias wrapper for callers."""
+    """Alias wrapper for compatibility with older imports."""
     return load_recent_queries(city_id=city_id, limit=limit, log_path=log_path)
