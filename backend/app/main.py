@@ -15,6 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from app.events.recent import load_recent_queries, RecentQuery
 
+from urllib.parse import urlencode
+
+LISTING_BASE = {
+    "buy": "/{city_slug}/{locality_slug}/buy",
+    "rent": "/{city_slug}/{locality_slug}/rent",
+}
+
 
 # -----------------------
 # Config
@@ -707,34 +714,48 @@ def filter_trending_localities(items: List[EntityOut]) -> List[EntityOut]:
 
 
 def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
-    """
-    V1 MVP: add constraints as query params to the location canonical url.
-    Later we can map to true SY DSE filter syntax.
-    """
-    base = entity.canonical_url
-    params: List[str] = []
+    base = (entity.canonical_url or "").rstrip("/")
+    if not base:
+        base = "/"
 
-    if parsed.intent:
-        params.append(f"intent={quote_plus(parsed.intent)}")
-    if parsed.property_type:
-        params.append(f"property_type={quote_plus(parsed.property_type)}")
-    if parsed.status:
-        params.append(f"status={quote_plus(parsed.status)}")
-    if parsed.bhk is not None:
-        params.append(f"bhk={parsed.bhk}")
-    if getattr(parsed, "min_price", None) is not None:
-        params.append(f"min_price={parsed.min_price}")
-    if parsed.max_price is not None:
-        params.append(f"max_price={parsed.max_price}")
-    if getattr(parsed, "min_rent", None) is not None:
-        params.append(f"min_rent={parsed.min_rent}")
-    if parsed.max_rent is not None:
-        params.append(f"max_rent={parsed.max_rent}")
+    intent = (getattr(parsed, "intent", None) or "").strip().lower()
+    segment = "rent" if intent == "rent" else "buy"
 
-    if not params:
-        return base
-    return base + ("?" + "&".join(params))
+    if entity.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview"):
+        base_with_intent = f"{base}/{segment}" if base != "/" else f"/{segment}"
+    else:
+        base_with_intent = base
 
+    params = {}
+
+    bhk = getattr(parsed, "bhk", None)
+    if bhk is not None:
+        params["bhk"] = bhk
+
+    min_price = getattr(parsed, "min_price", None)
+    max_price = getattr(parsed, "max_price", None)
+    if min_price is not None:
+        params["min_price"] = min_price
+    if max_price is not None:
+        params["max_price"] = max_price
+
+    min_rent = getattr(parsed, "min_rent", None)
+    max_rent = getattr(parsed, "max_rent", None)
+    if min_rent is not None:
+        params["min_rent"] = min_rent
+    if max_rent is not None:
+        params["max_rent"] = max_rent
+
+    status = getattr(parsed, "status", None)
+    if status:
+        params["status"] = status
+
+    property_type = getattr(parsed, "property_type", None) or getattr(parsed, "ptype", None)
+    if property_type:
+        params["property_type"] = property_type
+
+    qs = urlencode(params)
+    return base_with_intent + (f"?{qs}" if qs else "")
 
 # -----------------------
 # App + Routers
