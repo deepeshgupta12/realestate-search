@@ -558,6 +558,16 @@ def group_entities(entities: List[EntityOut]) -> Dict[str, List[EntityOut]]:
 
 
 def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
+    """
+    Trending = popularity-based list from ES, but post-processed for V0 UX:
+    - If city_id is present:
+        - Prefer city-matching entities first
+        - Then allow global entities (city_id == "")
+    - De-dupe within the list by (entity_type + normalized name)
+      so we don't show "Baner" twice across cities in zero-state.
+    """
+    fetch_size = min(max(limit * 6, 40), 200)
+
     if city_id:
         q = {
             "bool": {
@@ -565,7 +575,7 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
                     {"term": {"city_id": city_id}},
                     {"term": {"city_id": ""}},
                 ],
-                "minimum_should_match": 1
+                "minimum_should_match": 1,
             }
         }
     else:
@@ -574,14 +584,48 @@ def fetch_trending(city_id: Optional[str], limit: int) -> List[EntityOut]:
     res = es.search(
         index=INDEX_NAME,
         body={
-            "size": limit,
+            "size": fetch_size,
             "query": q,
-            "sort": [{"popularity_score": {"order": "desc"}}]
-        }
+            "sort": [
+                {"popularity_score": {"order": "desc", "missing": 0}},
+                {"_score": {"order": "desc"}},
+            ],
+        },
     )
     hits = res.get("hits", {}).get("hits", [])
-    return [hit_to_entity(h, for_trending=True) for h in hits]
+    items = [hit_to_entity(h, for_trending=True) for h in hits]
 
+    # City-first ordering (only when city_id is present)
+    if city_id:
+        def _bucket(e: EntityOut) -> int:
+            # 0 = requested city, 1 = global
+            if (e.city_id or "") == city_id:
+                return 0
+            return 1
+
+        items = sorted(
+            items,
+            key=lambda e: (
+                _bucket(e),
+                -(e.popularity_score or 0.0),
+                normalize_q(e.entity_type or ""),
+                normalize_q(e.name or ""),
+            ),
+        )
+
+    # De-dupe by (entity_type + normalized name)
+    seen = set()
+    out: List[EntityOut] = []
+    for e in items:
+        key = (e.entity_type or "", normalize_q(e.name or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+        if len(out) >= limit:
+            break
+
+    return out
 
 def filter_trending_localities(items: List[EntityOut]) -> List[EntityOut]:
     out: List[EntityOut] = []
