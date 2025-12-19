@@ -764,6 +764,29 @@ def log_click(ev: ClickEventIn) -> Dict[str, Any]:
     _append_jsonl(CLICK_EVENTS_PATH, ev.dict())
     return {"ok": True}
 
+@search.get("")
+def search_serp(
+    q: str = Query(..., min_length=1),
+    city_id: Optional[str] = None,
+    context_url: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=25),
+):
+    hits, total = es_search_entities(q=q, limit=limit, city_id=city_id, entity_types=None)
+    entities = [hit_to_entity(h) for h in hits]
+
+    # return a "wide" payload so FE won’t break if it expects a different key
+    return {
+        "ok": True,
+        "query": q,
+        "normalized_query": normalize_q(q),
+        "city_id": city_id,
+        "context_url": context_url,
+        "total": total,
+        "results": entities,
+        "entities": entities,
+        "items": entities,
+        "reason": "serp",
+    }
 
 @search.get("/zero-state", response_model=ZeroStateResponse)
 def zero_state(limit: int = 8, city_id: Optional[str] = None) -> ZeroStateResponse:
