@@ -10,7 +10,7 @@ from urllib.parse import quote_plus, urlparse
 
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import NotFoundError
-from fastapi import APIRouter, FastAPI, Query
+from fastapi import APIRouter, FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from app.events.recent import load_recent_queries, RecentQuery
@@ -31,7 +31,26 @@ REQUEST_TIMEOUT = float(os.getenv("ES_REQUEST_TIMEOUT", "3.0"))
 REDIRECTS_FILE = os.getenv("REDIRECTS_FILE", "backend/data/redirects.json")
 
 # Local event log folder (runtime; gitignored)
-EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "backend/.events"))
+# Always resolve relative to this backend package, not the current working directory.
+BACKEND_DIR = Path(__file__).resolve().parents[1]  # .../backend
+
+def _resolve_events_dir() -> Path:
+    env = os.getenv("EVENTS_DIR")
+    if env:
+        # Backward-compat: if someone sets EVENTS_DIR=backend/.events, strip the redundant prefix.
+        env_norm = env.replace("\\", "/")
+        if env_norm.startswith("backend/"):
+            env_norm = env_norm[len("backend/") :]
+
+        p = Path(env_norm)
+        if not p.is_absolute():
+            p = (BACKEND_DIR / p).resolve()
+        return p
+
+    # Default: <repo>/backend/.events
+    return BACKEND_DIR / ".events"
+
+EVENTS_DIR = _resolve_events_dir()
 SEARCH_EVENTS_FILE = EVENTS_DIR / "search.jsonl"
 CLICK_EVENTS_FILE = EVENTS_DIR / "click.jsonl"
 
@@ -151,6 +170,22 @@ class ClickEventIn(BaseModel):
 
 class EventOk(BaseModel):
     ok: bool
+
+class ClearRecentIn(BaseModel):
+    """Clear recent searches derived from search.jsonl.
+
+    V0 semantics:
+      - if city_id is provided: remove *search events* whose city_id matches
+      - if city_id is null: clear all search events (truncate search.jsonl)
+    """
+    city_id: Optional[str] = None
+
+
+class ClearRecentOut(BaseModel):
+    ok: bool
+    path: str
+    removed: int
+    kept: int
 
 
 # -----------------------
@@ -961,6 +996,72 @@ def log_click(evt: ClickEventIn):
         },
     )
     return EventOk(ok=True)
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Atomically overwrite a file by writing to a tmp file then renaming."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+@app.post("/api/v1/events/recent/clear", response_model=ClearRecentOut)
+def clear_recent(payload: ClearRecentIn):
+    """Clear recent searches by rewriting the search.jsonl log.
+
+    NOTE: "recent searches" in V0 is derived from search events. So clearing recents
+    removes rows from search.jsonl.
+    """
+    EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = SEARCH_EVENTS_FILE
+
+    if not path.exists():
+        return ClearRecentOut(ok=True, path=str(path), removed=0, kept=0)
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(True)  # keep newlines
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read {path}: {e}")
+
+    # Clear all
+    if payload.city_id is None:
+        removed = len([ln for ln in lines if ln.strip()])
+        try:
+            _atomic_write(path, "")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to truncate {path}: {e}")
+        return ClearRecentOut(ok=True, path=str(path), removed=removed, kept=0)
+
+    # Clear only matching city_id
+    target = payload.city_id
+    kept_lines: list[str] = []
+    removed = 0
+
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            obj = json.loads(ln)
+            ln_city = obj.get("city_id")
+        except Exception:
+            # If the line isn't valid JSON, keep it to avoid data loss
+            kept_lines.append(ln)
+            continue
+
+        if ln_city == target:
+            removed += 1
+        else:
+            kept_lines.append(ln)
+
+    try:
+        _atomic_write(path, "".join(kept_lines))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to rewrite {path}: {e}")
+
+    return ClearRecentOut(ok=True, path=str(path), removed=removed, kept=len(kept_lines))
 
 
 # Mount routers
