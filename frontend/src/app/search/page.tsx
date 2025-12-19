@@ -43,6 +43,10 @@ function sp1(v: string | string[] | undefined): string {
   return (v || "").trim();
 }
 
+function enc(v: string): string {
+  return encodeURIComponent(v);
+}
+
 async function apiGet<T>(path: string, params: Record<string, string | undefined>): Promise<T> {
   const usp = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -64,6 +68,16 @@ function groupToSections(r: SuggestResponse): Array<{ title: string; items: Sugg
   return s;
 }
 
+function sumTotal(r: SuggestResponse): number {
+  return (
+    r.groups.locations.length +
+    r.groups.projects.length +
+    r.groups.builders.length +
+    r.groups.rate_pages.length +
+    r.groups.property_pdps.length
+  );
+}
+
 export default async function SearchPage({ searchParams }: PageProps) {
   const sp = await searchParams;
 
@@ -72,12 +86,14 @@ export default async function SearchPage({ searchParams }: PageProps) {
   const qid = sp1(sp?.qid);
   const context_url = sp1(sp?.context_url) || "/";
 
+  const defaultCityId = city_id ? city_id : null;
+
   if (!q) {
     return (
       <main className="page">
         <h1 className="h1">Search</h1>
         <p className="sub">Type a query to see results.</p>
-        <SearchBar initialQ="" initialCityId={city_id} />
+        <SearchBar contextUrl={context_url} defaultCityId={defaultCityId} />
       </main>
     );
   }
@@ -89,42 +105,55 @@ export default async function SearchPage({ searchParams }: PageProps) {
   });
 
   const sections = groupToSections(data);
-  const total =
-    data.groups.locations.length +
-    data.groups.projects.length +
-    data.groups.builders.length +
-    data.groups.rate_pages.length +
-    data.groups.property_pdps.length;
+  const total = sumTotal(data);
+
+  const didYouMeanHref = data.did_you_mean
+    ? `/go?q=${enc(data.did_you_mean)}` +
+      (city_id ? `&city_id=${enc(city_id)}` : "") +
+      `&context_url=${enc(context_url)}`
+    : null;
+
+  const relaxedUsed = Boolean(data.fallbacks?.relaxed_used);
+  const fallbackReason = data.fallbacks?.reason || null;
+  const trendingFallback = data.fallbacks?.trending || [];
+  const showTrendingFallback = total === 0 && trendingFallback.length > 0;
 
   return (
     <main className="page">
-      <SearchBar initialQ={q} initialCityId={city_id} />
+      <SearchBar contextUrl={context_url} defaultCityId={defaultCityId} />
 
       <div className="serpMeta">
         Query: <strong>{q}</strong>
         <br />
         Results: <strong>{total}</strong>
-        {data.did_you_mean ? (
+
+        {data.did_you_mean && didYouMeanHref ? (
           <>
             <br />
             Did you mean:{" "}
-            <a
-              className="link"
-              href={`/go?q=${encodeURIComponent(data.did_you_mean)}&city_id=${encodeURIComponent(
-                city_id || ""
-              )}&context_url=${encodeURIComponent(context_url)}`}
-            >
+            <a className="link" href={didYouMeanHref}>
               <strong>{data.did_you_mean}</strong>
             </a>
           </>
         ) : null}
       </div>
 
+      {relaxedUsed ? (
+        <div className="card" style={{ borderColor: "rgba(255,255,255,0.18)" }}>
+          <div style={{ fontWeight: 700 }}>Showing broader matches</div>
+          <div style={{ color: "rgba(255,255,255,0.65)", marginTop: 6 }}>
+            We expanded your query to find more relevant results.
+            {fallbackReason ? ` (${fallbackReason})` : ""}
+          </div>
+        </div>
+      ) : null}
+
       {total === 0 ? (
         <div className="card">
           <div style={{ fontWeight: 700 }}>No results found</div>
           <div style={{ color: "rgba(255,255,255,0.65)", marginTop: 6 }}>
-            Try a different query.
+            Try a different query{data.did_you_mean ? " or use the suggestion above" : ""}.
+            {fallbackReason ? ` (${fallbackReason})` : ""}
           </div>
         </div>
       ) : (
@@ -133,15 +162,16 @@ export default async function SearchPage({ searchParams }: PageProps) {
             <div className="groupTitle">{sec.title}</div>
             {sec.items.map((it, idx) => {
               const rank = idx + 1;
+
               const goHref =
-                `/go?url=${encodeURIComponent(it.canonical_url)}` +
-                `&qid=${encodeURIComponent(qid || "")}` +
-                `&q=${encodeURIComponent(q)}` +
-                `&entity_id=${encodeURIComponent(it.id)}` +
-                `&entity_type=${encodeURIComponent(it.entity_type)}` +
-                `&rank=${encodeURIComponent(String(rank))}` +
-                `&city_id=${encodeURIComponent((it.city_id || city_id || "").toString())}` +
-                `&context_url=${encodeURIComponent(context_url)}`;
+                `/go?url=${enc(it.canonical_url)}` +
+                (qid ? `&qid=${enc(qid)}` : "") +
+                `&q=${enc(q)}` +
+                `&entity_id=${enc(it.id)}` +
+                `&entity_type=${enc(it.entity_type)}` +
+                `&rank=${enc(String(rank))}` +
+                `&city_id=${enc((it.city_id || city_id || "").toString())}` +
+                `&context_url=${enc(context_url)}`;
 
               return (
                 <div key={it.id} className="resultCard">
@@ -163,23 +193,25 @@ export default async function SearchPage({ searchParams }: PageProps) {
         ))
       )}
 
-      {data.fallbacks?.trending?.length ? (
+      {showTrendingFallback ? (
         <>
-          <div className="groupTitle">Trending</div>
-          {data.fallbacks.trending.map((it, idx) => {
+          <div className="groupTitle">Trending searches</div>
+
+          {trendingFallback.map((it, idx) => {
             const rank = idx + 1;
+
             const goHref =
-              `/go?url=${encodeURIComponent(it.canonical_url)}` +
-              `&qid=${encodeURIComponent(qid || "")}` +
-              `&q=${encodeURIComponent(it.name)}` +
-              `&entity_id=${encodeURIComponent(it.id)}` +
-              `&entity_type=${encodeURIComponent(it.entity_type)}` +
-              `&rank=${encodeURIComponent(String(rank))}` +
-              `&city_id=${encodeURIComponent((it.city_id || "").toString())}` +
-              `&context_url=${encodeURIComponent(context_url)}`;
+              `/go?url=${enc(it.canonical_url)}` +
+              (qid ? `&qid=${enc(qid)}` : "") +
+              `&q=${enc(it.name)}` +
+              `&entity_id=${enc(it.id)}` +
+              `&entity_type=${enc(it.entity_type)}` +
+              `&rank=${enc(String(rank))}` +
+              `&city_id=${enc((it.city_id || city_id || "").toString())}` +
+              `&context_url=${enc(context_url)}`;
 
             return (
-              <div key={it.id} className="resultCard">
+              <div key={`${it.id}_${idx}`} className="resultCard">
                 <div style={{ fontWeight: 700 }}>{it.name}</div>
                 <div style={{ color: "rgba(255,255,255,0.60)", fontSize: 12, marginTop: 4 }}>
                   {it.entity_type}
