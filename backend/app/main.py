@@ -757,6 +757,8 @@ def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
     intent = (getattr(parsed, "intent", None) or "").strip().lower()
     segment = "rent" if intent == "rent" else "buy"
 
+    params={}
+
     # ---------- NEW: project -> city-scoped listing path ----------
     # Project canonical is like: /projects/<city_slug>/<project-slug>
     if entity.entity_type == "project":
@@ -783,14 +785,29 @@ def build_listing_url(entity: EntityOut, parsed: ParseResponse) -> str:
 
     params = {}
 
-    # NEW: attach project_id when routing via project listing path
+# ----------------------------
+    # V1.x: project + constraints
+    # Route to city listing + project_id
+    # Example:
+    #   /projects/noida/godrej-woods  ->  /noida/buy?project_id=proj_godrej_woods&...
+    # ----------------------------
     if entity.entity_type == "project":
-        params["project_id"] = entity.id
+        city_slug = None
+        parts = base.strip("/").split("/")  # ["projects", "noida", "godrej-woods"]
+        if len(parts) >= 2 and parts[0] == "projects":
+            city_slug = parts[1]
 
-    # if your ParseResponse stores builder_id (from v1.3b), include it
-    builder_id = getattr(parsed, "builder_id", None)
-    if builder_id:
-        params["builder_id"] = builder_id
+        if city_slug:
+            base_with_intent = f"/{city_slug}/{segment}"
+            params["project_id"] = entity.id
+        else:
+            # fallback: keep project page if parsing fails
+            base_with_intent = base
+
+    elif entity.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview"):
+        base_with_intent = f"{base}/{segment}" if base != "/" else f"/{segment}"
+    else:
+        base_with_intent = base
 
     bhk = getattr(parsed, "bhk", None)
     if bhk is not None:
@@ -1125,7 +1142,7 @@ def resolve(
             if location_q:
                 lhits, _ = es_search_entities(q=location_q, limit=10, city_id=city_id)
                 lents = [hit_to_entity(h) for h in lhits]
-                locs = [e for e in lents if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview")]
+                locs = [e for e in lents if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview", "project")]
 
                 if locs:
                     lkey = normalize_q(location_q)
@@ -1220,7 +1237,7 @@ def resolve(
                     if len(scoped) == 1:
                         listing_url = build_listing_url(scoped[0], parsed)
                         if getattr(parsed, "builder_hint", None):
-                            bhits, _ = es_search_entities(q=parsed.builder_hint, limit=5, entity_types=["builder"])
+                            bhits, _ = es_search_entities(q=parsed.builder_hint, limit=5, city_id=None, entity_types=["builder"])
                             builders = [hit_to_entity(h) for h in bhits]
                             if builders:
                                 bkey = normalize_q(parsed.builder_hint)
