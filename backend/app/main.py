@@ -116,6 +116,7 @@ class ParseResponse(BaseModel):
     intent: Optional[str] = None  # buy | rent
     bhk: Optional[int] = None
     locality_hint: Optional[str] = None
+    builder_hint: Optional[str] = None
     # V1 intent + constraints
     page_intent: Optional[str] = None  # rate_page | locality_overview | listing | None
     location_query: Optional[str] = None  # cleaned location-ish part of the query
@@ -211,12 +212,12 @@ def money_to_rupees(num: float, unit: str) -> int:
         return int(num * 10_000_000)
     return int(num)
 
-
 def parse_query(q: str) -> ParseResponse:
     """Parse lightweight intent + constraints from a free-form search query.
 
     V0: intent(buy/rent), bhk, locality_hint, under X budget.
     V1: adds page_intent (rate_page/locality_overview/listing) and richer constraints.
+    V1.3: adds builder_hint extraction for queries like "dlf projects in noida".
     """
     raw = q
     s = normalize_q(q)
@@ -282,6 +283,28 @@ def parse_query(q: str) -> ParseResponse:
             break
 
     # ------------------
+    # Builder hint (V1.3)
+    # ------------------
+    builder_hint: Optional[str] = None
+
+    # Example: "dlf projects in noida" -> builder_hint="dlf"
+    m = re.search(r"^([a-z0-9&.\- ]+?)\s+(?:projects?|properties?|listings?|homes?)\b", s)
+    if m:
+        builder_hint = m.group(1).strip()
+
+    # Example: "projects by dlf in noida" -> builder_hint="dlf"
+    if not builder_hint:
+        m = re.search(r"\b(?:projects?|properties?|listings?|homes?)\s+(?:by|from)\s+([a-z0-9&.\- ]+?)(?:\s+\b(in|near|at)\b|$)", s)
+        if m:
+            builder_hint = m.group(1).strip()
+
+    # Example: "builder dlf in noida" -> builder_hint="dlf"
+    if not builder_hint:
+        m = re.search(r"\bbuilder\s+([a-z0-9&.\- ]+?)(?:\s+\b(in|near|at)\b|$)", s)
+        if m:
+            builder_hint = m.group(1).strip()
+
+    # ------------------
     # Location hint ("in Baner", "near Baner", "at Baner")
     # ------------------
     locality_hint: Optional[str] = None
@@ -344,14 +367,13 @@ def parse_query(q: str) -> ParseResponse:
         _apply_budget(money_to_rupees(v, u), None)
 
     # ------------------
-    # Decide listing intent: if it has constraints, it is a listing-ish query.
-    # (Even if the user didn't explicitly say 'buy'/'rent'.)
+    # Decide listing intent
     # ------------------
     if page_intent is None and any(v is not None for v in (bhk, status, property_type, min_price, max_price, min_rent, max_rent, intent)):
         page_intent = "listing"
 
     # ------------------
-    # Location-ish remainder (used for rate intent + listing routing)
+    # Location-ish remainder
     # ------------------
     loc = s
 
@@ -362,6 +384,12 @@ def parse_query(q: str) -> ParseResponse:
     loc = re.sub(r"\b(?:buy|resale|sale|rent|rental|tenant)\b", " ", loc)
     loc = re.sub(r"\b(ready\s*to\s*move|rtm|ready|under\s*construction|uc)\b", " ", loc)
     loc = re.sub(r"\b(builder\s*floor|floor|apartment|flat|plot|land|villa|independent\s*house|house|office|shop|retail)\b", " ", loc)
+
+    # remove builder/listing words
+    loc = re.sub(r"\b(projects?|properties?|listings?|homes?|developer|developers|builder|builders|by|from)\b", " ", loc)
+    if builder_hint:
+        # remove the builder name phrase from loc so we don't treat it as location
+        loc = re.sub(r"\b" + re.escape(builder_hint) + r"\b", " ", loc)
 
     # remove budget phrases
     loc = re.sub(r"\bbetween\b[\s\S]{0,40}\b(?:cr|crore|l|lac|lakh|k)\b", " ", loc)
@@ -390,8 +418,10 @@ def parse_query(q: str) -> ParseResponse:
         max_price=max_price,
         min_rent=min_rent,
         max_rent=max_rent,
+        builder_hint=builder_hint,
         ok=True,
     )
+
 
 def ensure_events_dir() -> None:
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1034,6 +1064,72 @@ def resolve(
                 reason="page_intent_confident_redirect",
                 debug={"page_intent": parsed.page_intent, "picked": picked.id},
             )
+        # V1.3: builder-intent → route to listing with builder filter (not builder page)
+    if getattr(parsed, "builder_hint", None):
+        # Resolve builder entity (prefer exact name)
+        bhits, _ = es_search_entities(
+            q=parsed.builder_hint,
+            limit=5,
+            city_id=None,
+            entity_types=["builder"],
+        )
+        builders = [hit_to_entity(h) for h in bhits]
+        if builders:
+            bkey = normalize_q(parsed.builder_hint)
+            exact_builders = [b for b in builders if normalize_q(b.name) == bkey]
+            builder_ent = (exact_builders or builders)[0]
+
+            # Find best base location to build listing URL on
+            base_ent = None
+            location_q = parsed.locality_hint or parsed.location_query
+            if location_q:
+                lhits, _ = es_search_entities(q=location_q, limit=10, city_id=city_id)
+                lents = [hit_to_entity(h) for h in lhits]
+                locs = [e for e in lents if e.entity_type in ("city", "micromarket", "locality", "listing_page", "locality_overview")]
+
+                if locs:
+                    lkey = normalize_q(location_q)
+                    exact_locs = [e for e in locs if normalize_q(e.name) == lkey]
+                    candidates = exact_locs or locs
+
+                    if city_id:
+                        in_city = [e for e in candidates if e.city_id == city_id]
+                        if in_city:
+                            base_ent = in_city[0]
+                    if base_ent is None:
+                        base_ent = candidates[0]
+
+            # If no location inferred but city_id is present, fall back to city entity
+            if base_ent is None and city_id:
+                chits, _ = es_search_entities(q=city_id, limit=5, city_id=None, entity_types=["city"])
+                cents = [hit_to_entity(h) for h in chits]
+                exact_city = [c for c in cents if c.id == city_id]
+                if exact_city:
+                    base_ent = exact_city[0]
+
+            if base_ent is not None:
+                listing_url = build_listing_url(base_ent, parsed)
+
+                # append builder_id param
+                if "?" in listing_url:
+                    listing_url = f"{listing_url}&builder_id={builder_ent.id}"
+                else:
+                    listing_url = f"{listing_url}?builder_id={builder_ent.id}"
+
+                return ResolveResponse(
+                    action="redirect",
+                    query=raw_q,
+                    normalized_query=parsed.q,
+                    url=listing_url,
+                    match=base_ent,
+                    reason="builder_intent_listing",
+                    debug={
+                        "builder_hint": parsed.builder_hint,
+                        "builder_id": builder_ent.id,
+                        "base": base_ent.canonical_url,
+                        "city_id": city_id,
+                    },
+                )
 
     # 2.7A: constraint-heavy → try DSE-style redirect if we can extract a location confidently
     if is_constraint_heavy(raw_q):
