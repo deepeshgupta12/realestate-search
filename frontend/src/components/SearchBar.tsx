@@ -5,26 +5,11 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 /**
- * SearchBar (v1.7b)
- * - Autocomplete + recent searches
- * - Enter triggers /search/resolve and client-side redirects
- *
- * NOTE: This version intentionally does NOT depend on "@/lib/api" to avoid env/base URL issues.
+ * SearchBar (v1.8d)
+ * - Recent searches (works with BE payloads that contain either {raw_query, query_id} OR {q})
+ * - Autocomplete (prefers /search/suggest; falls back to /search/autocomplete if present)
+ * - Enter triggers /search/resolve and client-side redirect
  */
-
-type AutocompleteItem = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
-  city_id?: string;
-  canonical_url?: string;
-  score?: number;
-};
-
-type AutocompleteResponse = {
-  items: AutocompleteItem[];
-};
 
 type ResolveMatch = {
   id: string;
@@ -49,36 +34,66 @@ type ResolveResponse = {
   debug: any;
 };
 
-type RecentItem = {
-  query_id: string;
-  raw_query: string;
-  normalized_query: string;
+type SuggestItem = {
+  id: string;
+  entity_type: string;
+  name: string;
+  city?: string;
+  city_id?: string;
+  canonical_url?: string;
+  score?: number;
+};
+
+type SuggestResponseV1 = {
+  items?: SuggestItem[];
+};
+
+type SuggestResponseV2 = {
+  ok?: boolean;
+  groups?: {
+    locations?: SuggestItem[];
+    projects?: SuggestItem[];
+    pages?: SuggestItem[];
+  };
+};
+
+type RecentItemV1 = {
+  query_id?: string;
+  raw_query?: string;
+  normalized_query?: string;
+  city_id: string | null;
+  context_url: string;
+  timestamp: string;
+};
+
+type RecentItemV2 = {
+  q?: string;
   city_id: string | null;
   context_url: string;
   timestamp: string;
 };
 
 type RecentResponse = {
-  items: RecentItem[];
+  ok?: boolean;
+  items?: Array<RecentItemV1 & RecentItemV2>;
 };
 
 function normalizeBase(raw: string | undefined, fallback: string) {
-  // Defensive parsing: sometimes people accidentally pass the whole .env line,
-  // or the string may include newlines.
   let v = (raw ?? "").trim();
   if (!v) v = fallback;
 
-  // If someone accidentally provided "NEXT_PUBLIC_API_V1_BASE=http://..."
+  // handle accidental "NEXT_PUBLIC_API_V1_BASE=http://..."
   if (v.includes("NEXT_PUBLIC_API_V1_BASE=")) {
     v = v.split("NEXT_PUBLIC_API_V1_BASE=").pop() || fallback;
   }
   if (v.includes("\n")) {
-    v = v.split("\n").map((s) => s.trim()).find(Boolean) || v;
+    v = v
+      .split("\n")
+      .map((s) => s.trim())
+      .find(Boolean) || v;
   }
 
-  // Remove trailing slash
-  v = v.replace(/\/+$/, "");
-  return v;
+  return v.replace(/\/+$/, "");
 }
 
 function pickCitySlug(pathname: string) {
@@ -88,7 +103,6 @@ function pickCitySlug(pathname: string) {
 
 function citySlugToId(citySlug: string | null): string | null {
   if (!citySlug) return null;
-  // Minimal mapping for this MVP (extend later)
   const m: Record<string, string> = {
     pune: "city_pune",
     noida: "city_noida",
@@ -96,7 +110,15 @@ function citySlugToId(citySlug: string | null): string | null {
   return m[citySlug.toLowerCase()] || null;
 }
 
-async function apiGetJson<T>(base: string, path: string, params?: Record<string, string | number | null | undefined>) {
+function safeString(v: any) {
+  return typeof v === "string" ? v : "";
+}
+
+async function apiGetJson<T>(
+  base: string,
+  path: string,
+  params?: Record<string, string | number | null | undefined>,
+) {
   const usp = new URLSearchParams();
   Object.entries(params ?? {}).forEach(([k, v]) => {
     if (v === null || v === undefined || v === "") return;
@@ -109,218 +131,270 @@ async function apiGetJson<T>(base: string, path: string, params?: Record<string,
   return (await res.json()) as T;
 }
 
-async function apiPostJson<T>(
-  base: string,
-  path: string,
-  body: Record<string, any>,
-) {
+async function apiPostJson<T>(base: string, path: string, body: Record<string, any>) {
   const url = `${base}${path}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    cache: "no-store",
   });
   if (!res.ok) throw new Error(`POST ${path} failed: ${res.status}`);
   return (await res.json()) as T;
 }
 
+function parseSuggestItems(data: any): SuggestItem[] {
+  // supports:
+  // - { items: [...] }
+  // - { ok: true, groups: { locations/projects/pages: [...] } }
+  if (Array.isArray(data?.items)) return data.items as SuggestItem[];
+  const groups = data?.groups;
+  if (groups && typeof groups === "object") {
+    const loc = Array.isArray(groups.locations) ? groups.locations : [];
+    const proj = Array.isArray(groups.projects) ? groups.projects : [];
+    const pages = Array.isArray(groups.pages) ? groups.pages : [];
+    return [...loc, ...proj, ...pages] as SuggestItem[];
+  }
+  return [];
+}
+
+function getRecentLabel(it: any): string {
+  const raw = safeString(it?.raw_query).trim();
+  if (raw) return raw;
+
+  const q = safeString(it?.q).trim();
+  if (q) return q;
+
+  const norm = safeString(it?.normalized_query).trim();
+  if (norm) return norm;
+
+  return "";
+}
+
+function getRecentKey(it: any, idx: number): string {
+  const qid = safeString(it?.query_id);
+  if (qid) return qid;
+  const t = safeString(it?.timestamp);
+  const q = getRecentLabel(it);
+  return `${t || "t"}:${q || "q"}:${idx}`;
+}
+
 export default function SearchBar() {
   const router = useRouter();
-  const pathname = usePathname() || "/";
-  const [q, setQ] = useState("");
-  const [open, setOpen] = useState(false);
-  const [loadingAuto, setLoadingAuto] = useState(false);
-  const [loadingRecent, setLoadingRecent] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const pathname = usePathname();
 
-  const [items, setItems] = useState<AutocompleteItem[]>([]);
-  const [recent, setRecent] = useState<RecentItem[]>([]);
-
-  const blurTimer = useRef<number | null>(null);
-  const lastAutoReq = useRef(0);
-
-  const apiV1Base = useMemo(() => {
-    // Prefer V1 base; fall back to API_BASE + /api/v1 if you only set NEXT_PUBLIC_API_BASE.
-    const v1 = normalizeBase(process.env.NEXT_PUBLIC_API_V1_BASE, "");
-    if (v1) return v1;
-
-    const base = normalizeBase(process.env.NEXT_PUBLIC_API_BASE, "http://localhost:8000");
-    return `${base}/api/v1`.replace(/\/+$/, "");
-  }, []);
-
-  const citySlug = useMemo(() => pickCitySlug(pathname), [pathname]);
+  const citySlug = useMemo(() => pickCitySlug(pathname || "/"), [pathname]);
   const cityId = useMemo(() => citySlugToId(citySlug), [citySlug]);
-
   const contextUrl = useMemo(() => {
-    // Use the first segment as city context if available, else "/"
-    return citySlug ? `/${encodeURIComponent(citySlug)}` : "/";
+    // your BE expects a "context_url" like "/" or "/noida" etc.
+    // For this MVP we keep only the first segment context: "/" or "/<city>"
+    return citySlug ? `/${citySlug}` : "/";
   }, [citySlug]);
 
+  const apiV1Base = useMemo(() => {
+    // Prefer NEXT_PUBLIC_API_V1_BASE, else fall back to NEXT_PUBLIC_API_BASE + /api/v1, else hardcode local
+    const rawV1 = (process.env.NEXT_PUBLIC_API_V1_BASE as string | undefined) ?? "";
+    const rawBase = (process.env.NEXT_PUBLIC_API_BASE as string | undefined) ?? "";
+
+    if (rawV1.trim()) return normalizeBase(rawV1, "http://localhost:8000/api/v1");
+    if (rawBase.trim()) return normalizeBase(rawBase, "http://localhost:8000") + "/api/v1";
+    return "http://localhost:8000/api/v1";
+  }, []);
+
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const [recent, setRecent] = useState<Array<any>>([]);
+  const [recentErr, setRecentErr] = useState<string | null>(null);
+
+  const [suggestions, setSuggestions] = useState<SuggestItem[]>([]);
+  const [suggestErr, setSuggestErr] = useState<string | null>(null);
+
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
   async function loadRecent() {
-    setLoadingRecent(true);
-    setErr(null);
+    setRecentErr(null);
     try {
       const data = await apiGetJson<RecentResponse>(apiV1Base, "/events/recent", {
         context_url: contextUrl,
         limit: 8,
+        // Only send city_id if you actually have one (prevents accidental "undefined")
+        city_id: cityId,
       });
-      setRecent(data.items ?? []);
+
+      const items = Array.isArray((data as any)?.items) ? (data as any).items : [];
+      setRecent(items);
     } catch (e: any) {
-      setErr(e?.message || "Failed to load recent searches");
       setRecent([]);
-    } finally {
-      setLoadingRecent(false);
+      setRecentErr(e?.message || "failed");
     }
   }
 
-  async function runAutocomplete(query: string) {
-    const trimmed = query.trim();
-    if (trimmed.length < 2) {
-      setItems([]);
+  async function loadSuggestions(q: string) {
+    setSuggestErr(null);
+    try {
+      // Prefer /search/suggest (your BE has this)
+      const data = await apiGetJson<SuggestResponseV1 & SuggestResponseV2>(apiV1Base, "/search/suggest", {
+        q,
+        limit: 20,
+        city_id: cityId,
+        context_url: contextUrl,
+      });
+
+      const items = parseSuggestItems(data);
+      setSuggestions(items);
+      return;
+    } catch (e1: any) {
+      // Fallback: older BE might have /search/autocomplete
+      try {
+        const data2 = await apiGetJson<SuggestResponseV1 & SuggestResponseV2>(apiV1Base, "/search/autocomplete", {
+          q,
+          limit: 20,
+          city_id: cityId,
+          context_url: contextUrl,
+        });
+
+        const items2 = parseSuggestItems(data2);
+        setSuggestions(items2);
+        return;
+      } catch (e2: any) {
+        setSuggestions([]);
+        setSuggestErr(e2?.message || e1?.message || "failed");
+      }
+    }
+  }
+
+  async function persistSearch(q: string) {
+    const raw = q.trim();
+    if (!raw) return;
+
+    const payload = {
+      query_id: `qid_${Date.now()}`,
+      raw_query: raw,
+      normalized_query: raw.toLowerCase(),
+      city_id: cityId ?? null,
+      context_url: contextUrl,
+      timestamp: new Date().toISOString(),
+    };
+
+    try {
+      await apiPostJson(apiV1Base, "/events/search", payload);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  async function resolveAndRedirect(rawQ: string) {
+    const q = rawQ.trim();
+    if (!q) return;
+
+    // persist first (so recent is written even if resolve/disambiguate)
+    await persistSearch(q);
+
+    // then resolve
+    const data = await apiGetJson<ResolveResponse>(apiV1Base, "/search/resolve", {
+      q,
+      city_id: cityId,
+      context_url: contextUrl,
+    });
+
+    if (data.action === "redirect") {
+      router.push(data.url);
       return;
     }
 
-    const reqId = Date.now();
-    lastAutoReq.current = reqId;
-
-    setLoadingAuto(true);
-    setErr(null);
-
-    try {
-      const data = await apiGetJson<AutocompleteResponse>(apiV1Base, "/search/autocomplete", {
-        q: trimmed,
-        city_id: cityId,
-        context_url: contextUrl,
-      });
-      // ignore stale responses
-      if (lastAutoReq.current !== reqId) return;
-      setItems(data.items ?? []);
-    } catch (e: any) {
-      if (lastAutoReq.current !== reqId) return;
-      setErr(e?.message || "Autocomplete failed");
-      setItems([]);
-    } finally {
-      if (lastAutoReq.current === reqId) setLoadingAuto(false);
+    if (data.action === "disambiguate") {
+      router.push(`/disambiguate?q=${encodeURIComponent(q)}&context_url=${encodeURIComponent(contextUrl)}`);
+      return;
     }
+
+    // serp fallback
+    router.push(`/search?q=${encodeURIComponent(q)}&city_id=${encodeURIComponent(cityId ?? "")}&context_url=${encodeURIComponent(contextUrl)}`);
   }
 
-  function storeDisambiguation(payload: { query: string; candidates: ResolveMatch[] }) {
-    try {
-      sessionStorage.setItem("disambiguate_payload_v1", JSON.stringify(payload));
-    } catch {
-      // ignore
-    }
-  }
-
-  async function resolveAndRedirect(rawQuery: string) {
-    const trimmed = rawQuery.trim();
-    if (!trimmed) return;
-
-    setErr(null);
-
-    try {
-      const data = await apiGetJson<ResolveResponse>(apiV1Base, "/search/resolve", {
-        q: trimmed,
-        city_id: cityId,
-        context_url: contextUrl,
-      });
-
-      // Track searches (best-effort; non-blocking)
-      void apiPostJson(apiV1Base, "/events/search", {
-        query_id: `qid_${Date.now()}`,
-        raw_query: trimmed,
-        normalized_query: data.normalized_query ?? trimmed,
-        city_id: cityId,
-        context_url: contextUrl,
-        timestamp: new Date().toISOString(),
-      }).catch(() => {});
-
-      if (data.action === "redirect" || data.action === "serp") {
-        router.push(data.url);
-        return;
-      }
-
-      if (data.action === "disambiguate") {
-        storeDisambiguation({
-          query: trimmed,
-          candidates: data.candidates ?? [],
-        });
-        router.push(`/disambiguate?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(contextUrl)}`);
-        return;
-      }
-
-      // Fallback: SERP
-      router.push(`/search?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(contextUrl)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`);
-    } catch (e: any) {
-      setErr(e?.message || "Resolve failed");
-    }
-  }
-
-  function onFocus() {
-    setOpen(true);
-    if (blurTimer.current) window.clearTimeout(blurTimer.current);
-    // Load recent on focus (esp for homepage)
-    void loadRecent();
-  }
-
-  function onBlur() {
-    // small delay so clicks inside dropdown still work
-    blurTimer.current = window.setTimeout(() => setOpen(false), 120);
-  }
-
-  function onClear() {
-    setQ("");
-    setItems([]);
-    setErr(null);
-    setOpen(false);
-  }
-
+  // When dropdown opens & query is empty-ish -> load recent
   useEffect(() => {
-    // When the context changes (city route), refresh recent searches
-    void loadRecent();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contextUrl]);
+    if (!open) return;
+    if (query.trim().length >= 2) return;
+
+    let cancelled = false;
+    (async () => {
+      await loadRecent();
+      if (cancelled) return;
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // IMPORTANT: depend on cityId (not city_id) to avoid ReferenceError
+  }, [open, query, cityId, contextUrl, apiV1Base]);
+
+  // When dropdown is open and query >=2 -> load suggestions
+  useEffect(() => {
+    if (!open) return;
+    const q = query.trim();
+    if (q.length < 2) {
+      setSuggestions([]);
+      setSuggestErr(null);
+      return;
+    }
+
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        await loadSuggestions(q);
+      } finally {
+        if (cancelled) return;
+      }
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [open, query, cityId, contextUrl, apiV1Base]);
+
+  const showRecent = open && query.trim().length < 2;
+  const showSuggest = open && query.trim().length >= 2;
 
   return (
-    <div style={{ width: "min(720px, 92vw)", margin: "0 auto" }}>
-      <div style={{ display: "flex", gap: 8 }}>
+    <div style={{ width: "min(760px, 92vw)" }}>
+      <div style={{ display: "flex", gap: 10 }}>
         <input
-          value={q}
-          onChange={(e) => {
-            const v = e.target.value;
-            setQ(v);
-            setOpen(true);
-            void runAutocomplete(v);
-          }}
-          onKeyDown={(e) => {
+          ref={inputRef}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onFocus={() => setOpen(true)}
+          onKeyDown={async (e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              void resolveAndRedirect(q);
-            } else if (e.key === "Escape") {
-              onClear();
+              setOpen(false);
+              await resolveAndRedirect(query);
+            }
+            if (e.key === "Escape") {
+              setOpen(false);
             }
           }}
-          onFocus={onFocus}
-          onBlur={onBlur}
           placeholder="Search city / locality / project..."
           style={{
             flex: 1,
             padding: "10px 12px",
             borderRadius: 8,
             border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.06)",
+            background: "rgba(0,0,0,0.25)",
             color: "white",
             outline: "none",
           }}
         />
         <button
-          onClick={() => void resolveAndRedirect(q)}
+          onClick={async () => {
+            setOpen(false);
+            await resolveAndRedirect(query);
+          }}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.10)",
+            background: "rgba(255,255,255,0.08)",
             color: "white",
             cursor: "pointer",
           }}
@@ -329,154 +403,189 @@ export default function SearchBar() {
         </button>
       </div>
 
-      {(open || err) && (
+      {open && (
         <div
           style={{
             marginTop: 8,
             borderRadius: 10,
             border: "1px solid rgba(255,255,255,0.14)",
-            background: "rgba(0,0,0,0.50)",
+            background: "rgba(0,0,0,0.35)",
             overflow: "hidden",
           }}
-          onMouseDown={(e) => {
-            // prevent input blur when clicking dropdown content
-            e.preventDefault();
-          }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 12px" }}>
-            <div style={{ opacity: 0.9, fontSize: 13 }}>
-              <span style={{ marginRight: 10 }}>
-                <b>context:</b> {contextUrl}
-              </span>
-              {cityId && (
-                <span>
-                  <b>city_id:</b> {cityId}
-                </span>
-              )}
+          <div style={{ padding: "10px 12px", fontSize: 12, opacity: 0.9, display: "flex", justifyContent: "space-between" }}>
+            <div>
+              <b>context:</b> {contextUrl}
             </div>
             <button
-              onClick={onClear}
+              onClick={() => {
+                setQuery("");
+                setSuggestions([]);
+                setRecent([]);
+                setRecentErr(null);
+                setSuggestErr(null);
+                inputRef.current?.focus();
+              }}
               style={{
-                fontSize: 12,
-                background: "transparent",
                 border: "none",
-                color: "rgba(255,255,255,0.85)",
+                background: "transparent",
+                color: "white",
+                opacity: 0.9,
                 cursor: "pointer",
                 textDecoration: "underline",
+                fontSize: 12,
               }}
             >
               Clear
             </button>
           </div>
 
-          {err && (
-            <div style={{ padding: "10px 12px", color: "#ff6b6b", fontSize: 13, borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              {err}
+          {showRecent && (
+            <div style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
+              <div style={{ padding: "10px 12px", fontSize: 12, opacity: 0.9 }}>
+                <b>Recent searches</b>
+              </div>
+
+              {recentErr && (
+                <div style={{ padding: "8px 12px", fontSize: 12, color: "salmon" }}>
+                  GET /events/recent failed: {recentErr}
+                </div>
+              )}
+
+              {(!recent || recent.length === 0) && !recentErr && (
+                <div style={{ padding: "8px 12px", fontSize: 12, opacity: 0.8 }}>No recent searches yet</div>
+              )}
+
+              {Array.isArray(recent) &&
+                recent.map((r: any, idx: number) => {
+                  const label = getRecentLabel(r);
+                  if (!label) return null;
+
+                  return (
+                    <div
+                      key={getRecentKey(r, idx)}
+                      style={{
+                        padding: "10px 12px",
+                        borderTop: "1px solid rgba(255,255,255,0.08)",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 12,
+                        alignItems: "center",
+                      }}
+                    >
+                      <button
+                        onClick={async () => {
+                          setQuery(label);
+                          setOpen(false);
+                          await resolveAndRedirect(label);
+                        }}
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          color: "white",
+                          cursor: "pointer",
+                          textAlign: "left",
+                          padding: 0,
+                        }}
+                        title="Run this search"
+                      >
+                        {label}
+                      </button>
+
+                      <Link
+                        href={`/search?q=${encodeURIComponent(label)}&city_id=${encodeURIComponent(cityId ?? "")}&context_url=${encodeURIComponent(
+                          contextUrl,
+                        )}`}
+                        onClick={() => setOpen(false)}
+                        style={{ fontSize: 12, opacity: 0.9, textDecoration: "underline" }}
+                      >
+                        Go to SERP
+                      </Link>
+                    </div>
+                  );
+                })}
+
+              <div style={{ padding: "10px 12px", fontSize: 12, opacity: 0.75 }}>
+                <div>
+                  <b>API:</b> {apiV1Base}
+                </div>
+                <div style={{ marginTop: 6 }}>Tip: try <b>Baner</b>, <b>Godrej woods</b>, or <b>zzzzzz</b>.</div>
+              </div>
             </div>
           )}
 
-          {/* Autocomplete */}
-          {q.trim().length >= 2 && (
+          {showSuggest && (
             <div style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              <div style={{ padding: "8px 12px", fontSize: 12, opacity: 0.85 }}>
-                {loadingAuto ? "Searching…" : items.length ? "Suggestions" : "No suggestions"}
-              </div>
+              {suggestErr && (
+                <div style={{ padding: "8px 12px", fontSize: 12, color: "salmon" }}>
+                  GET /search/suggest failed: {suggestErr}
+                </div>
+              )}
 
-              {items.map((it) => (
-                <button
-                  key={it.id}
-                  onClick={() => {
-                    setQ(it.name);
-                    setOpen(false);
-                    void resolveAndRedirect(it.name);
-                  }}
-                  style={{
-                    width: "100%",
-                    textAlign: "left",
-                    padding: "10px 12px",
-                    background: "transparent",
-                    border: "none",
-                    borderTop: "1px solid rgba(255,255,255,0.08)",
-                    color: "white",
-                    cursor: "pointer",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                    <div style={{ fontSize: 14 }}>
-                      {it.name}{" "}
-                      <span style={{ opacity: 0.7, fontSize: 12 }}>
-                        ({it.entity_type}
-                        {it.city ? ` · ${it.city}` : ""})
-                      </span>
-                    </div>
-                    {it.canonical_url && (
-                      <span style={{ opacity: 0.7, fontSize: 12, whiteSpace: "nowrap" }}>{it.canonical_url}</span>
+              {(!suggestions || suggestions.length === 0) && !suggestErr && (
+                <div style={{ padding: "10px 12px", fontSize: 12, opacity: 0.8 }}>No suggestions</div>
+              )}
+
+              {Array.isArray(suggestions) &&
+                suggestions.map((s, idx) => (
+                  <div
+                    key={`${s.id || "id"}:${s.entity_type || "t"}:${idx}`}
+                    style={{
+                      padding: "10px 12px",
+                      borderTop: "1px solid rgba(255,255,255,0.08)",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 12,
+                      alignItems: "center",
+                    }}
+                  >
+                    <button
+                      onClick={async () => {
+                        setOpen(false);
+                        await resolveAndRedirect(s.name);
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        color: "white",
+                        cursor: "pointer",
+                        textAlign: "left",
+                        padding: 0,
+                      }}
+                      title="Resolve and go"
+                    >
+                      <div style={{ fontSize: 13 }}>
+                        {s.name}{" "}
+                        <span style={{ fontSize: 12, opacity: 0.75 }}>
+                          ({s.entity_type}
+                          {s.city ? ` • ${s.city}` : ""})
+                        </span>
+                      </div>
+                    </button>
+
+                    {s.canonical_url ? (
+                      <Link
+                        href={s.canonical_url}
+                        onClick={() => setOpen(false)}
+                        style={{ fontSize: 12, opacity: 0.9, textDecoration: "underline" }}
+                      >
+                        Open
+                      </Link>
+                    ) : (
+                      <span style={{ fontSize: 12, opacity: 0.5 }}> </span>
                     )}
                   </div>
-                </button>
-              ))}
-            </div>
-          )}
+                ))}
 
-          {/* Recent searches (zero-state) */}
-          {q.trim().length < 2 && (
-            <div style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              <div style={{ padding: "8px 12px", fontSize: 12, opacity: 0.85 }}>
-                {loadingRecent ? "Loading recent…" : recent.length ? "Recent searches" : "No recent searches yet"}
-              </div>
-
-              {recent.map((r) => (
-                <div
-                  key={r.query_id}
-                  style={{
-                    padding: "10px 12px",
-                    borderTop: "1px solid rgba(255,255,255,0.08)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    alignItems: "center",
-                  }}
-                >
-                  <button
-                    onClick={() => {
-                      setQ(r.raw_query);
-                      setOpen(false);
-                      void resolveAndRedirect(r.raw_query);
-                    }}
-                    style={{
-                      flex: 1,
-                      textAlign: "left",
-                      background: "transparent",
-                      border: "none",
-                      color: "white",
-                      cursor: "pointer",
-                      padding: 0,
-                    }}
-                  >
-                    <div style={{ fontSize: 14 }}>{r.raw_query}</div>
-                    <div style={{ fontSize: 12, opacity: 0.65 }}>
-                      {r.context_url} {r.city_id ? `· ${r.city_id}` : ""}
-                    </div>
-                  </button>
-
-                  <Link
-                    href={`/search?q=${encodeURIComponent(r.raw_query)}&context_url=${encodeURIComponent(r.context_url)}${r.city_id ? `&city_id=${encodeURIComponent(r.city_id)}` : ""}`}
-                    style={{ fontSize: 12, opacity: 0.8, textDecoration: "underline", color: "white", whiteSpace: "nowrap" }}
-                  >
-                    Go to SERP
-                  </Link>
+              <div style={{ padding: "10px 12px", fontSize: 12, opacity: 0.75 }}>
+                <div>
+                  <b>API:</b> {apiV1Base}
                 </div>
-              ))}
+              </div>
             </div>
           )}
         </div>
       )}
-
-      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>
-        <div>
-          <b>API:</b> {apiV1Base}
-        </div>
-      </div>
     </div>
   );
 }

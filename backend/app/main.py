@@ -20,8 +20,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
-from dataclasses import dataclass
+import uuid  # noqa: F401
+from dataclasses import dataclass  # noqa: F401
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -147,6 +147,17 @@ app.add_middleware(
 )
 
 api = APIRouter(prefix="/api/v1")
+
+
+class SuggestResponse(BaseModel):
+    ok: bool = True
+    items: List[EntityOut] = Field(default_factory=list)
+
+
+class RecentResponse(BaseModel):
+    ok: bool = True
+    items: List[RecentSearchOut] = Field(default_factory=list)
+
 search = APIRouter(prefix="/search", tags=["search"])
 events = APIRouter(prefix="/events", tags=["events"])
 
@@ -753,40 +764,57 @@ def health() -> Dict[str, Any]:
     }
 
 
+@events.get("/recent", response_model=RecentResponse)
+def recent(context_url: str = "/", limit: int = 8, city_id: Optional[str] = None):
+    """Return recent searches for the given context_url (and optionally city).
+
+    Rules:
+    - context_url="/" means global (no context filtering)
+    - city_id is optional; treat "", "undefined", "null" as None
+    - normalize stored context_url so empty becomes "/"
+    """
+    # --- normalize inputs ---
+    context_url = (context_url or "/").strip() or "/"
+    if not context_url.startswith("/"):
+        context_url = "/" + context_url
+    if context_url != "/" and context_url.endswith("/"):
+        context_url = context_url[:-1]
+
+    if city_id is not None:
+        city_id = (city_id or "").strip()
+        if city_id.lower() in ("", "undefined", "null", "none"):
+            city_id = None
+
+    limit = max(1, min(int(limit or 8), 50))
+
+    # Overfetch, then filter/dedupe in Python
+    items = _get_recent_searches(limit=limit * 5, city_id=city_id)
+
+    def norm_ctx(u: Optional[str]) -> str:
+        u = (u or "/").strip() or "/"
+        if not u.startswith("/"):
+            u = "/" + u
+        if u != "/" and u.endswith("/"):
+            u = u[:-1]
+        return u
+
+    # Only filter by context when context is not root
+    if context_url != "/":
+        items = [it for it in items if norm_ctx(getattr(it, "context_url", None)) == context_url]
+
+    return RecentResponse(items=items[:limit])
+
 @events.post("/search")
 def log_search(ev: SearchEventIn) -> Dict[str, Any]:
-    _append_jsonl(SEARCH_EVENTS_PATH, ev.dict())
+    _append_jsonl(SEARCH_EVENTS_PATH, ev.model_dump())
     return {"ok": True}
 
 
 @events.post("/click")
 def log_click(ev: ClickEventIn) -> Dict[str, Any]:
-    _append_jsonl(CLICK_EVENTS_PATH, ev.dict())
+    _append_jsonl(CLICK_EVENTS_PATH, ev.model_dump())
     return {"ok": True}
 
-@search.get("")
-def search_serp(
-    q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-    context_url: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=25),
-):
-    hits, total = es_search_entities(q=q, limit=limit, city_id=city_id, entity_types=None)
-    entities = [hit_to_entity(h) for h in hits]
-
-    # return a "wide" payload so FE won’t break if it expects a different key
-    return {
-        "ok": True,
-        "query": q,
-        "normalized_query": normalize_q(q),
-        "city_id": city_id,
-        "context_url": context_url,
-        "total": total,
-        "results": entities,
-        "entities": entities,
-        "items": entities,
-        "reason": "serp",
-    }
 
 @search.get("/zero-state", response_model=ZeroStateResponse)
 def zero_state(limit: int = 8, city_id: Optional[str] = None) -> ZeroStateResponse:
@@ -804,6 +832,40 @@ def zero_state(limit: int = 8, city_id: Optional[str] = None) -> ZeroStateRespon
         popular_entities=popular_entities,
     )
 
+
+
+
+@search.get("/suggest", response_model=SuggestResponse)
+def suggest(q: str, limit: int = 20, city_id: Optional[str] = None):
+    """Autocomplete suggestions (ES-backed).
+
+    FE uses this on /disambiguate and for inline suggestions.
+    """
+    q = (q or "").strip()
+    if not q:
+        return SuggestResponse(items=[])
+
+    # clamp to avoid abuse
+    limit = max(1, min(int(limit or 20), 50))
+
+    hits, _ = es_search_entities(q=q, limit=limit, city_id=city_id, entity_types=None)
+    items = [hit_to_entity(h) for h in (hits or [])]
+    return SuggestResponse(items=items)
+
+
+@search.get("/autocomplete", response_model=SuggestResponse)
+def autocomplete(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=50),
+    city_id: Optional[str] = Query(None),
+    context_url: Optional[str] = Query(None),
+):
+    """Alias for FE: same response as /search/suggest.
+
+    Accepts `context_url` for forward compatibility (ignored).
+    """
+    _ = context_url
+    return suggest(q=q, limit=limit, city_id=city_id)
 
 @search.get("/resolve", response_model=ResolveResponse)
 def resolve(
