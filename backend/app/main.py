@@ -800,7 +800,7 @@ def _get_trending_searches(
     window_days: int = 7,
 ) -> List[TrendingSearchOut]:
     # Read a larger tail so "trending" has enough sample even on a small dev dataset.
-    lines = _read_jsonl_tail(SEARCH_EVENTS_PATH, max_lines=5000)
+    lines = _read_jsonl_tail(SEARCH_EVENTS_PATH, limit=5000)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days or 7)))
 
