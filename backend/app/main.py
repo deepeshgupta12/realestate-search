@@ -20,8 +20,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
-from dataclasses import dataclass
+import uuid  # noqa: F401
+from dataclasses import dataclass  # noqa: F401
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -764,32 +764,55 @@ def health() -> Dict[str, Any]:
     }
 
 
-
-
 @events.get("/recent", response_model=RecentResponse)
 def recent(context_url: str = "/", limit: int = 8, city_id: Optional[str] = None):
     """Return recent searches for the given context_url (and optionally city).
 
-    FE home uses this to render the 'Recent searches' block (zero-state).
+    Rules:
+    - context_url="/" means global (no context filtering)
+    - city_id is optional; treat "", "undefined", "null" as None
+    - normalize stored context_url so empty becomes "/"
     """
+    # --- normalize inputs ---
     context_url = (context_url or "/").strip() or "/"
+    if not context_url.startswith("/"):
+        context_url = "/" + context_url
+    if context_url != "/" and context_url.endswith("/"):
+        context_url = context_url[:-1]
+
+    if city_id is not None:
+        city_id = (city_id or "").strip()
+        if city_id.lower() in ("", "undefined", "null", "none"):
+            city_id = None
+
     limit = max(1, min(int(limit or 8), 50))
 
-    items = _get_recent_searches(limit=limit * 3, city_id=city_id)  # overfetch, then filter
-    if context_url and context_url != "/":
-        items = [it for it in items if (it.context_url or "/") == context_url]
+    # Overfetch, then filter/dedupe in Python
+    items = _get_recent_searches(limit=limit * 5, city_id=city_id)
+
+    def norm_ctx(u: Optional[str]) -> str:
+        u = (u or "/").strip() or "/"
+        if not u.startswith("/"):
+            u = "/" + u
+        if u != "/" and u.endswith("/"):
+            u = u[:-1]
+        return u
+
+    # Only filter by context when context is not root
+    if context_url != "/":
+        items = [it for it in items if norm_ctx(getattr(it, "context_url", None)) == context_url]
 
     return RecentResponse(items=items[:limit])
 
 @events.post("/search")
 def log_search(ev: SearchEventIn) -> Dict[str, Any]:
-    _append_jsonl(SEARCH_EVENTS_PATH, ev.dict())
+    _append_jsonl(SEARCH_EVENTS_PATH, ev.model_dump())
     return {"ok": True}
 
 
 @events.post("/click")
 def log_click(ev: ClickEventIn) -> Dict[str, Any]:
-    _append_jsonl(CLICK_EVENTS_PATH, ev.dict())
+    _append_jsonl(CLICK_EVENTS_PATH, ev.model_dump())
     return {"ok": True}
 
 
