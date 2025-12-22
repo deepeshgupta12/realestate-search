@@ -1,125 +1,103 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 /**
- * SearchBar (v1.7b)
- * - Autocomplete + recent searches
- * - Enter triggers /search/resolve and client-side redirects
- *
- * NOTE: This version intentionally does NOT depend on "@/lib/api" to avoid env/base URL issues.
+ * SearchBar
+ * - Autocomplete: GET /api/v1/search/autocomplete?q=...&limit=...&city_id=...
+ * - Enter / Search button: GET /api/v1/search/resolve?q=...&city_id=...&context_url=... -> redirect
+ * - Recent (zero-state): GET /api/v1/events/recent?context_url=...&limit=...
+ * - Persist searches: POST /api/v1/events/search
  */
 
-type AutocompleteItem = {
+type EntityType =
+  | "city"
+  | "locality"
+  | "micromarket"
+  | "project"
+  | "rate_page"
+  | "locality_overview"
+  | "developer"
+  | "builder"
+  | "other";
+
+type SuggestItem = {
   id: string;
-  entity_type: string;
+  entity_type: EntityType | string;
   name: string;
-  city?: string;
-  city_id?: string;
-  canonical_url?: string;
-  score?: number;
+  city_id?: string | null;
+  city?: string | null;
+  parent_name?: string | null;
+  canonical_url?: string | null;
+  score?: number | null;
+  popularity_score?: number | null;
 };
 
 type AutocompleteResponse = {
-  items: AutocompleteItem[];
-};
-
-type ResolveMatch = {
-  id: string;
-  entity_type: string;
-  name: string;
-  city?: string;
-  city_id?: string;
-  parent_name?: string;
-  canonical_url?: string;
-  score?: number;
-  popularity_score?: number;
+  ok: boolean;
+  items: SuggestItem[];
 };
 
 type ResolveResponse = {
-  action: "redirect" | "serp" | "disambiguate";
+  action: "redirect" | "disambiguate" | "serp";
   query: string;
   normalized_query: string;
-  url: string;
-  match: ResolveMatch | null;
-  candidates: ResolveMatch[] | null;
-  reason: string;
-  debug: any;
+  url?: string | null;
+  candidates?: SuggestItem[] | null;
+  reason?: string | null;
+  match?: SuggestItem | null;
+  debug?: Record<string, any> | null;
 };
 
 type RecentItem = {
-  query_id: string;
-  raw_query: string;
-  normalized_query: string;
+  q: string;
   city_id: string | null;
   context_url: string;
-  timestamp: string;
+  ts: string;
 };
 
 type RecentResponse = {
+  ok: boolean;
   items: RecentItem[];
 };
 
-function normalizeBase(raw: string | undefined, fallback: string) {
-  // Defensive parsing: sometimes people accidentally pass the whole .env line,
-  // or the string may include newlines.
-  let v = (raw ?? "").trim();
-  if (!v) v = fallback;
+const API_V1_BASE =
+  process.env.NEXT_PUBLIC_API_V1_BASE || "http://localhost:8000/api/v1";
 
-  // If someone accidentally provided "NEXT_PUBLIC_API_V1_BASE=http://..."
-  if (v.includes("NEXT_PUBLIC_API_V1_BASE=")) {
-    v = v.split("NEXT_PUBLIC_API_V1_BASE=").pop() || fallback;
+function safeCityIdFromPathname(pathname: string): string | null {
+  // Our routes are /[city]/... or /property-rates/[city]/...
+  const parts = (pathname || "/").split("?")[0].split("/").filter(Boolean);
+  if (!parts.length) return null;
+
+  // If route is /property-rates/pune/baner => city is parts[1]
+  if (parts[0] === "property-rates" && parts.length >= 2) {
+    const citySlug = parts[1];
+    return citySlug ? `city_${citySlug}` : null;
   }
-  if (v.includes("\n")) {
-    v = v.split("\n").map((s) => s.trim()).find(Boolean) || v;
-  }
 
-  // Remove trailing slash
-  v = v.replace(/\/+$/, "");
-  return v;
+  // If route is /pune/baner/buy => city is parts[0]
+  const citySlug = parts[0];
+  return citySlug ? `city_${citySlug}` : null;
 }
 
-function pickCitySlug(pathname: string) {
-  const parts = pathname.split("?")[0].split("/").filter(Boolean);
-  return parts.length ? parts[0] : null;
-}
-
-function citySlugToId(citySlug: string | null): string | null {
-  if (!citySlug) return null;
-  // Minimal mapping for this MVP (extend later)
-  const m: Record<string, string> = {
-    pune: "city_pune",
-    noida: "city_noida",
-  };
-  return m[citySlug.toLowerCase()] || null;
-}
-
-async function apiGetJson<T>(base: string, path: string, params?: Record<string, string | number | null | undefined>) {
+async function apiGet<T>(path: string, params: Record<string, string | undefined>) {
   const usp = new URLSearchParams();
-  Object.entries(params ?? {}).forEach(([k, v]) => {
-    if (v === null || v === undefined || v === "") return;
-    usp.set(k, String(v));
-  });
-
-  const url = `${base}${path}${usp.toString() ? `?${usp.toString()}` : ""}`;
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== "") usp.set(k, v);
+  }
+  const url = `${API_V1_BASE}${path}?${usp.toString()}`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
   return (await res.json()) as T;
 }
 
-async function apiPostJson<T>(
-  base: string,
-  path: string,
-  body: Record<string, any>,
-) {
-  const url = `${base}${path}`;
+async function apiPost<T>(path: string, body: any) {
+  const url = `${API_V1_BASE}${path}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    cache: "no-store",
   });
   if (!res.ok) throw new Error(`POST ${path} failed: ${res.status}`);
   return (await res.json()) as T;
@@ -127,356 +105,404 @@ async function apiPostJson<T>(
 
 export default function SearchBar() {
   const router = useRouter();
-  const pathname = usePathname() || "/";
-  const [q, setQ] = useState("");
-  const [open, setOpen] = useState(false);
-  const [loadingAuto, setLoadingAuto] = useState(false);
-  const [loadingRecent, setLoadingRecent] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const pathname = usePathname();
+  const sp = useSearchParams();
 
-  const [items, setItems] = useState<AutocompleteItem[]>([]);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const [loadingSuggest, setLoadingSuggest] = useState(false);
+  const [suggestErr, setSuggestErr] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<SuggestItem[]>([]);
+
+  const [loadingRecent, setLoadingRecent] = useState(false);
+  const [recentErr, setRecentErr] = useState<string | null>(null);
   const [recent, setRecent] = useState<RecentItem[]>([]);
 
-  const blurTimer = useRef<number | null>(null);
-  const lastAutoReq = useRef(0);
+  const [busyResolve, setBusyResolve] = useState(false);
+  const [resolveErr, setResolveErr] = useState<string | null>(null);
 
-  const apiV1Base = useMemo(() => {
-    // Prefer V1 base; fall back to API_BASE + /api/v1 if you only set NEXT_PUBLIC_API_BASE.
-    const v1 = normalizeBase(process.env.NEXT_PUBLIC_API_V1_BASE, "");
-    if (v1) return v1;
-
-    const base = normalizeBase(process.env.NEXT_PUBLIC_API_BASE, "http://localhost:8000");
-    return `${base}/api/v1`.replace(/\/+$/, "");
-  }, []);
-
-  const citySlug = useMemo(() => pickCitySlug(pathname), [pathname]);
-  const cityId = useMemo(() => citySlugToId(citySlug), [citySlug]);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   const contextUrl = useMemo(() => {
-    // Use the first segment as city context if available, else "/"
-    return citySlug ? `/${encodeURIComponent(citySlug)}` : "/";
-  }, [citySlug]);
+    // If caller provided explicit context_url, respect it; else use current pathname.
+    const ctx = sp.get("context_url");
+    return ctx && ctx.startsWith("/") ? ctx : pathname || "/";
+  }, [sp, pathname]);
 
-  async function loadRecent() {
-    setLoadingRecent(true);
-    setErr(null);
-    try {
-      const data = await apiGetJson<RecentResponse>(apiV1Base, "/events/recent", {
-        context_url: contextUrl,
-        limit: 8,
-      });
-      setRecent(data.items ?? []);
-    } catch (e: any) {
-      setErr(e?.message || "Failed to load recent searches");
-      setRecent([]);
-    } finally {
-      setLoadingRecent(false);
+  const cityId = useMemo(() => {
+    // If explicit city_id in URL, use it; else infer from pathname.
+    const cid = sp.get("city_id");
+    if (cid) return cid;
+    return safeCityIdFromPathname(pathname || "/") || undefined;
+  }, [sp, pathname]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function onDocDown(e: MouseEvent) {
+      if (!boxRef.current) return;
+      if (!boxRef.current.contains(e.target as Node)) setOpen(false);
     }
-  }
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, []);
 
-  async function runAutocomplete(query: string) {
-    const trimmed = query.trim();
-    if (trimmed.length < 2) {
-      setItems([]);
+  // Load recent searches when opening dropdown (zero-state)
+  useEffect(() => {
+    if (!open) return;
+    setLoadingRecent(true);
+    setRecentErr(null);
+
+    apiGet<RecentResponse>("/events/recent", {
+      context_url: contextUrl,
+      limit: "8",
+    })
+      .then((data) => setRecent(data.items || []))
+      .catch((e: any) => setRecentErr(e?.message || String(e)))
+      .finally(() => setLoadingRecent(false));
+  }, [open, contextUrl]);
+
+  // Autocomplete
+  useEffect(() => {
+    const q = query.trim();
+    if (!open) return;
+
+    if (!q) {
+      setSuggestions([]);
+      setSuggestErr(null);
+      setLoadingSuggest(false);
       return;
     }
 
-    const reqId = Date.now();
-    lastAutoReq.current = reqId;
+    let cancelled = false;
+    setLoadingSuggest(true);
+    setSuggestErr(null);
 
-    setLoadingAuto(true);
-    setErr(null);
-
-    try {
-      const data = await apiGetJson<AutocompleteResponse>(apiV1Base, "/search/autocomplete", {
-        q: trimmed,
-        city_id: cityId,
-        context_url: contextUrl,
+    apiGet<AutocompleteResponse>("/search/autocomplete", {
+      q,
+      limit: "20",
+      city_id,
+      context_url: contextUrl, // accepted (ignored) by BE alias
+    })
+      .then((data) => {
+        if (cancelled) return;
+        setSuggestions(data.items || []);
+      })
+      .catch((e: any) => {
+        if (cancelled) return;
+        setSuggestErr(e?.message || String(e));
+        setSuggestions([]);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoadingSuggest(false);
       });
-      // ignore stale responses
-      if (lastAutoReq.current !== reqId) return;
-      setItems(data.items ?? []);
-    } catch (e: any) {
-      if (lastAutoReq.current !== reqId) return;
-      setErr(e?.message || "Autocomplete failed");
-      setItems([]);
-    } finally {
-      if (lastAutoReq.current === reqId) setLoadingAuto(false);
-    }
-  }
 
-  function storeDisambiguation(payload: { query: string; candidates: ResolveMatch[] }) {
+    return () => {
+      cancelled = true;
+    };
+  }, [query, open, city_id, contextUrl]);
+
+  async function persistSearch(q: string) {
+    const payload = {
+      query_id: `qid_${Date.now()}`,
+      raw_query: q,
+      normalized_query: q.toLowerCase(),
+      city_id: city_id ?? null,
+      context_url: contextUrl,
+      timestamp: new Date().toISOString(),
+    };
     try {
-      sessionStorage.setItem("disambiguate_payload_v1", JSON.stringify(payload));
+      await apiPost<{ ok: boolean }>("/events/search", payload);
     } catch {
-      // ignore
+      // non-blocking
     }
   }
 
-  async function resolveAndRedirect(rawQuery: string) {
-    const trimmed = rawQuery.trim();
+  async function doResolve(q: string) {
+    const trimmed = q.trim();
     if (!trimmed) return;
 
-    setErr(null);
+    setBusyResolve(true);
+    setResolveErr(null);
 
     try {
-      const data = await apiGetJson<ResolveResponse>(apiV1Base, "/search/resolve", {
+      await persistSearch(trimmed);
+
+      const data = await apiGet<ResolveResponse>("/search/resolve", {
         q: trimmed,
-        city_id: cityId,
+        city_id: city_id,
         context_url: contextUrl,
       });
 
-      // Track searches (best-effort; non-blocking)
-      void apiPostJson(apiV1Base, "/events/search", {
-        query_id: `qid_${Date.now()}`,
-        raw_query: trimmed,
-        normalized_query: data.normalized_query ?? trimmed,
-        city_id: cityId,
-        context_url: contextUrl,
-        timestamp: new Date().toISOString(),
-      }).catch(() => {});
-
-      if (data.action === "redirect" || data.action === "serp") {
+      if (data.action === "redirect" && data.url) {
+        setOpen(false);
         router.push(data.url);
         return;
       }
 
       if (data.action === "disambiguate") {
-        storeDisambiguation({
-          query: trimmed,
-          candidates: data.candidates ?? [],
-        });
-        router.push(`/disambiguate?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(contextUrl)}`);
+        setOpen(false);
+        router.push(
+          `/disambiguate?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(
+            contextUrl
+          )}${city_id ? `&city_id=${encodeURIComponent(city_id)}` : ""}`
+        );
         return;
       }
 
-      // Fallback: SERP
-      router.push(`/search?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(contextUrl)}${cityId ? `&city_id=${encodeURIComponent(cityId)}` : ""}`);
+      // fallback: SERP
+      setOpen(false);
+      router.push(
+        `/search?q=${encodeURIComponent(trimmed)}&context_url=${encodeURIComponent(contextUrl)}${
+          city_id ? `&city_id=${encodeURIComponent(city_id)}` : ""
+        }`
+      );
     } catch (e: any) {
-      setErr(e?.message || "Resolve failed");
+      setResolveErr(e?.message || String(e));
+    } finally {
+      setBusyResolve(false);
     }
   }
 
-  function onFocus() {
-    setOpen(true);
-    if (blurTimer.current) window.clearTimeout(blurTimer.current);
-    // Load recent on focus (esp for homepage)
-    void loadRecent();
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      doResolve(query);
+    }
+    if (e.key === "Escape") {
+      setOpen(false);
+    }
   }
-
-  function onBlur() {
-    // small delay so clicks inside dropdown still work
-    blurTimer.current = window.setTimeout(() => setOpen(false), 120);
-  }
-
-  function onClear() {
-    setQ("");
-    setItems([]);
-    setErr(null);
-    setOpen(false);
-  }
-
-  useEffect(() => {
-    // When the context changes (city route), refresh recent searches
-    void loadRecent();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contextUrl]);
 
   return (
-    <div style={{ width: "min(720px, 92vw)", margin: "0 auto" }}>
-      <div style={{ display: "flex", gap: 8 }}>
+    <div ref={boxRef} style={{ width: "100%", maxWidth: 760 }}>
+      <div style={{ display: "flex", gap: 10 }}>
         <input
-          value={q}
-          onChange={(e) => {
-            const v = e.target.value;
-            setQ(v);
-            setOpen(true);
-            void runAutocomplete(v);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              void resolveAndRedirect(q);
-            } else if (e.key === "Escape") {
-              onClear();
-            }
-          }}
-          onFocus={onFocus}
-          onBlur={onBlur}
+          ref={inputRef}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onFocus={() => setOpen(true)}
+          onKeyDown={onKeyDown}
           placeholder="Search city / locality / project..."
           style={{
             flex: 1,
             padding: "10px 12px",
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.06)",
-            color: "white",
+            borderRadius: 10,
+            border: "1px solid #333",
+            background: "rgba(0,0,0,0.25)",
+            color: "inherit",
             outline: "none",
           }}
         />
         <button
-          onClick={() => void resolveAndRedirect(q)}
+          onClick={() => doResolve(query)}
+          disabled={busyResolve}
           style={{
             padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(255,255,255,0.10)",
-            color: "white",
-            cursor: "pointer",
+            borderRadius: 10,
+            border: "1px solid #333",
+            background: "rgba(255,255,255,0.06)",
+            color: "inherit",
+            cursor: busyResolve ? "not-allowed" : "pointer",
           }}
         >
-          Search
+          {busyResolve ? "…" : "Search"}
         </button>
       </div>
 
-      {(open || err) && (
+      {open ? (
         <div
           style={{
-            marginTop: 8,
-            borderRadius: 10,
-            border: "1px solid rgba(255,255,255,0.14)",
-            background: "rgba(0,0,0,0.50)",
+            marginTop: 10,
+            borderRadius: 12,
+            border: "1px solid #333",
+            background: "rgba(0,0,0,0.35)",
             overflow: "hidden",
           }}
-          onMouseDown={(e) => {
-            // prevent input blur when clicking dropdown content
-            e.preventDefault();
-          }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 12px" }}>
-            <div style={{ opacity: 0.9, fontSize: 13 }}>
-              <span style={{ marginRight: 10 }}>
-                <b>context:</b> {contextUrl}
-              </span>
-              {cityId && (
-                <span>
-                  <b>city_id:</b> {cityId}
-                </span>
-              )}
+          <div
+            style={{
+              padding: "10px 12px",
+              borderBottom: "1px solid #2a2a2a",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+            }}
+          >
+            <div style={{ fontSize: 13, opacity: 0.9 }}>
+              <b>context:</b> {contextUrl}
             </div>
             <button
-              onClick={onClear}
+              onClick={() => {
+                setQuery("");
+                setSuggestions([]);
+                setSuggestErr(null);
+                setResolveErr(null);
+                inputRef.current?.focus();
+              }}
               style={{
-                fontSize: 12,
-                background: "transparent",
                 border: "none",
-                color: "rgba(255,255,255,0.85)",
+                background: "transparent",
+                color: "inherit",
                 cursor: "pointer",
                 textDecoration: "underline",
+                fontSize: 12,
+                opacity: 0.85,
               }}
             >
               Clear
             </button>
           </div>
 
-          {err && (
-            <div style={{ padding: "10px 12px", color: "#ff6b6b", fontSize: 13, borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              {err}
-            </div>
-          )}
-
-          {/* Autocomplete */}
-          {q.trim().length >= 2 && (
-            <div style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              <div style={{ padding: "8px 12px", fontSize: 12, opacity: 0.85 }}>
-                {loadingAuto ? "Searching…" : items.length ? "Suggestions" : "No suggestions"}
-              </div>
-
-              {items.map((it) => (
-                <button
-                  key={it.id}
-                  onClick={() => {
-                    setQ(it.name);
-                    setOpen(false);
-                    void resolveAndRedirect(it.name);
-                  }}
-                  style={{
-                    width: "100%",
-                    textAlign: "left",
-                    padding: "10px 12px",
-                    background: "transparent",
-                    border: "none",
-                    borderTop: "1px solid rgba(255,255,255,0.08)",
-                    color: "white",
-                    cursor: "pointer",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                    <div style={{ fontSize: 14 }}>
-                      {it.name}{" "}
-                      <span style={{ opacity: 0.7, fontSize: 12 }}>
-                        ({it.entity_type}
-                        {it.city ? ` · ${it.city}` : ""})
-                      </span>
-                    </div>
-                    {it.canonical_url && (
-                      <span style={{ opacity: 0.7, fontSize: 12, whiteSpace: "nowrap" }}>{it.canonical_url}</span>
-                    )}
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Recent searches (zero-state) */}
-          {q.trim().length < 2 && (
-            <div style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
-              <div style={{ padding: "8px 12px", fontSize: 12, opacity: 0.85 }}>
-                {loadingRecent ? "Loading recent…" : recent.length ? "Recent searches" : "No recent searches yet"}
-              </div>
-
-              {recent.map((r) => (
-                <div
-                  key={r.query_id}
-                  style={{
-                    padding: "10px 12px",
-                    borderTop: "1px solid rgba(255,255,255,0.08)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    alignItems: "center",
-                  }}
-                >
-                  <button
-                    onClick={() => {
-                      setQ(r.raw_query);
-                      setOpen(false);
-                      void resolveAndRedirect(r.raw_query);
-                    }}
-                    style={{
-                      flex: 1,
-                      textAlign: "left",
-                      background: "transparent",
-                      border: "none",
-                      color: "white",
-                      cursor: "pointer",
-                      padding: 0,
-                    }}
-                  >
-                    <div style={{ fontSize: 14 }}>{r.raw_query}</div>
-                    <div style={{ fontSize: 12, opacity: 0.65 }}>
-                      {r.context_url} {r.city_id ? `· ${r.city_id}` : ""}
-                    </div>
-                  </button>
-
-                  <Link
-                    href={`/search?q=${encodeURIComponent(r.raw_query)}&context_url=${encodeURIComponent(r.context_url)}${r.city_id ? `&city_id=${encodeURIComponent(r.city_id)}` : ""}`}
-                    style={{ fontSize: 12, opacity: 0.8, textDecoration: "underline", color: "white", whiteSpace: "nowrap" }}
-                  >
-                    Go to SERP
-                  </Link>
+          {/* Autocomplete section */}
+          {query.trim() ? (
+            <div style={{ padding: "10px 12px" }}>
+              {suggestErr ? (
+                <div style={{ color: "#ff6b6b", fontSize: 13 }}>
+                  GET /search/autocomplete failed: {suggestErr.includes("failed:")
+                    ? suggestErr.split("failed:").slice(-1)[0].trim()
+                    : suggestErr}
                 </div>
-              ))}
+              ) : loadingSuggest ? (
+                <div style={{ fontSize: 13, opacity: 0.8 }}>Loading suggestions…</div>
+              ) : suggestions.length === 0 ? (
+                <div style={{ fontSize: 13, opacity: 0.75 }}>No suggestions</div>
+              ) : (
+                <div style={{ display: "grid", gap: 8 }}>
+                  {suggestions.slice(0, 8).map((s) => {
+                    const meta = [s.city || "", s.parent_name || "", String(s.entity_type || "")]
+                      .filter(Boolean)
+                      .join(" · ");
+                    return (
+                      <button
+                        key={`${s.entity_type}:${s.id}`}
+                        onClick={() => {
+                          setQuery(s.name);
+                          doResolve(s.name);
+                        }}
+                        style={{
+                          textAlign: "left",
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid #2a2a2a",
+                          background: "rgba(255,255,255,0.04)",
+                          color: "inherit",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <div style={{ fontWeight: 650 }}>{s.name}</div>
+                        {meta ? (
+                          <div style={{ opacity: 0.75, fontSize: 12, marginTop: 4 }}>{meta}</div>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {resolveErr ? (
+                <div style={{ marginTop: 10, color: "#ff6b6b", fontSize: 13 }}>
+                  Resolve error: {resolveErr}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            /* Zero-state: recent searches */
+            <div style={{ padding: "10px 12px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 13, fontWeight: 650, opacity: 0.9 }}>Recent searches</div>
+                <button
+                  onClick={() => router.push(`/search?q=&context_url=${encodeURIComponent(contextUrl)}`)}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    color: "inherit",
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                    fontSize: 12,
+                    opacity: 0.85,
+                  }}
+                >
+                  Go to SERP
+                </button>
+              </div>
+
+              {recentErr ? (
+                <div style={{ marginTop: 10, color: "#ff6b6b", fontSize: 13 }}>
+                  GET /events/recent failed: {recentErr}
+                </div>
+              ) : loadingRecent ? (
+                <div style={{ marginTop: 10, fontSize: 13, opacity: 0.8 }}>Loading…</div>
+              ) : recent.length === 0 ? (
+                <div style={{ marginTop: 10, fontSize: 13, opacity: 0.75 }}>
+                  No recent searches yet
+                </div>
+              ) : (
+                <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                  {recent.map((r) => {
+                    const label = r.q;
+                    return (
+                      <div
+                        key={`${r.ts}-${r.q}`}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid #2a2a2a",
+                          background: "rgba(255,255,255,0.03)",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 10,
+                        }}
+                      >
+                        <button
+                          onClick={() => setQuery(r.q)}
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            color: "inherit",
+                            cursor: "pointer",
+                            textAlign: "left",
+                            padding: 0,
+                            flex: 1,
+                          }}
+                        >
+                          <div style={{ fontWeight: 650 }}>{label}</div>
+                          <div style={{ opacity: 0.7, fontSize: 12, marginTop: 4 }}>
+                            <code>{r.context_url}</code>
+                          </div>
+                        </button>
+
+                        <button
+                          onClick={() => doResolve(r.q)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #2a2a2a",
+                            background: "rgba(255,255,255,0.04)",
+                            color: "inherit",
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          Go
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+                API: {API_V1_BASE}
+              </div>
             </div>
           )}
         </div>
-      )}
-
-      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>
-        <div>
-          <b>API:</b> {apiV1Base}
-        </div>
-      </div>
+      ) : null}
     </div>
   );
 }

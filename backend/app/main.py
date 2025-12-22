@@ -829,6 +829,21 @@ def suggest(q: str, limit: int = 20, city_id: Optional[str] = None):
     items = [hit_to_entity(h) for h in (hits or [])]
     return SuggestResponse(items=items)
 
+
+@search.get("/autocomplete", response_model=SuggestResponse)
+def autocomplete(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=50),
+    city_id: Optional[str] = Query(None),
+    context_url: Optional[str] = Query(None),
+):
+    """Alias for FE: same response as /search/suggest.
+
+    Accepts `context_url` for forward compatibility (ignored).
+    """
+    _ = context_url
+    return suggest(q=q, limit=limit, city_id=city_id)
+
 @search.get("/resolve", response_model=ResolveResponse)
 def resolve(
     q: str = Query(..., min_length=1),
