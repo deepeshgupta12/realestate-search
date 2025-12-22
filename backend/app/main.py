@@ -22,7 +22,7 @@ import os
 import re
 import uuid  # noqa: F401
 from dataclasses import dataclass  # noqa: F401
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, quote_plus
@@ -157,6 +157,18 @@ class SuggestResponse(BaseModel):
 class RecentResponse(BaseModel):
     ok: bool = True
     items: List[RecentSearchOut] = Field(default_factory=list)
+
+
+class TrendingSearchOut(BaseModel):
+    q: str
+    count: int
+    city_id: Optional[str] = None
+    context_url: Optional[str] = None
+
+
+class TrendingResponse(BaseModel):
+    ok: bool = True
+    items: List[TrendingSearchOut] = Field(default_factory=list)
 
 search = APIRouter(prefix="/search", tags=["search"])
 events = APIRouter(prefix="/events", tags=["events"])
@@ -764,6 +776,68 @@ def health() -> Dict[str, Any]:
     }
 
 
+def _parse_event_ts(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        s = ts.strip()
+        # common format: 2025-12-22T09:08:27.598Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _get_trending_searches(
+    limit: int = 6,
+    *,
+    city_id: Optional[str] = None,
+    context_url: Optional[str] = None,
+    window_days: int = 7,
+) -> List[TrendingSearchOut]:
+    # Read a larger tail so "trending" has enough sample even on a small dev dataset.
+    lines = _read_jsonl_tail(SEARCH_EVENTS_PATH, max_lines=5000)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days or 7)))
+
+    counts: Dict[str, int] = {}
+    meta: Dict[str, Tuple[str, Optional[str], str]] = {}  # key -> (display_q, city_id, context_url)
+
+    for ev in lines:
+        q = (ev.get("normalized_query") or ev.get("raw_query") or "").strip()
+        if not q:
+            continue
+
+        ev_city = ev.get("city_id")
+        ev_ctx = (ev.get("context_url") or "/").strip() or "/"
+
+        if city_id and ev_city != city_id:
+            continue
+        if context_url and ev_ctx != context_url:
+            continue
+
+        dt = _parse_event_ts(ev.get("timestamp"))
+        if dt and dt < cutoff:
+            continue
+
+        key = q.lower()
+        counts[key] = counts.get(key, 0) + 1
+        # keep latest display/meta (tail is chronological, so overwrite gives latest)
+        meta[key] = (q, ev_city, ev_ctx)
+
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[: max(1, limit)]
+    out: List[TrendingSearchOut] = []
+    for key, cnt in ranked:
+        display_q, ev_city, ev_ctx = meta.get(key, (key, None, "/"))
+        out.append(TrendingSearchOut(q=display_q, count=cnt, city_id=ev_city, context_url=ev_ctx))
+    return out
+
+
+
 @events.get("/recent", response_model=RecentResponse)
 def recent(context_url: str = "/", limit: int = 8, city_id: Optional[str] = None):
     """Return recent searches for the given context_url (and optionally city).
@@ -803,6 +877,25 @@ def recent(context_url: str = "/", limit: int = 8, city_id: Optional[str] = None
         items = [it for it in items if norm_ctx(getattr(it, "context_url", None)) == context_url]
 
     return RecentResponse(items=items[:limit])
+
+@events.get("/trending", response_model=TrendingResponse)
+def trending(
+    context_url: str = "/",
+    limit: int = 6,
+    city_id: Optional[str] = None,
+    window_days: int = 7,
+):
+    """Return trending searches for the given context_url (and optionally city).
+
+    FE uses this to render the 'Trending searches' block (zero-state).
+    """
+    context_url = (context_url or "/").strip() or "/"
+    limit = max(1, min(int(limit or 6), 50))
+
+    items = _get_trending_searches(limit=limit, city_id=city_id, context_url=context_url, window_days=window_days)
+    return TrendingResponse(items=items)
+
+
 
 @events.post("/search")
 def log_search(ev: SearchEventIn) -> Dict[str, Any]:
