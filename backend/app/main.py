@@ -147,6 +147,17 @@ app.add_middleware(
 )
 
 api = APIRouter(prefix="/api/v1")
+
+
+class SuggestResponse(BaseModel):
+    ok: bool = True
+    items: List[EntityOut] = Field(default_factory=list)
+
+
+class RecentResponse(BaseModel):
+    ok: bool = True
+    items: List[RecentSearchOut] = Field(default_factory=list)
+
 search = APIRouter(prefix="/search", tags=["search"])
 events = APIRouter(prefix="/events", tags=["events"])
 
@@ -753,6 +764,23 @@ def health() -> Dict[str, Any]:
     }
 
 
+
+
+@events.get("/recent", response_model=RecentResponse)
+def recent(context_url: str = "/", limit: int = 8, city_id: Optional[str] = None):
+    """Return recent searches for the given context_url (and optionally city).
+
+    FE home uses this to render the 'Recent searches' block (zero-state).
+    """
+    context_url = (context_url or "/").strip() or "/"
+    limit = max(1, min(int(limit or 8), 50))
+
+    items = _get_recent_searches(limit=limit * 3, city_id=city_id)  # overfetch, then filter
+    if context_url and context_url != "/":
+        items = [it for it in items if (it.context_url or "/") == context_url]
+
+    return RecentResponse(items=items[:limit])
+
 @events.post("/search")
 def log_search(ev: SearchEventIn) -> Dict[str, Any]:
     _append_jsonl(SEARCH_EVENTS_PATH, ev.dict())
@@ -764,29 +792,6 @@ def log_click(ev: ClickEventIn) -> Dict[str, Any]:
     _append_jsonl(CLICK_EVENTS_PATH, ev.dict())
     return {"ok": True}
 
-@search.get("")
-def search_serp(
-    q: str = Query(..., min_length=1),
-    city_id: Optional[str] = None,
-    context_url: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=25),
-):
-    hits, total = es_search_entities(q=q, limit=limit, city_id=city_id, entity_types=None)
-    entities = [hit_to_entity(h) for h in hits]
-
-    # return a "wide" payload so FE won’t break if it expects a different key
-    return {
-        "ok": True,
-        "query": q,
-        "normalized_query": normalize_q(q),
-        "city_id": city_id,
-        "context_url": context_url,
-        "total": total,
-        "results": entities,
-        "entities": entities,
-        "items": entities,
-        "reason": "serp",
-    }
 
 @search.get("/zero-state", response_model=ZeroStateResponse)
 def zero_state(limit: int = 8, city_id: Optional[str] = None) -> ZeroStateResponse:
@@ -804,6 +809,25 @@ def zero_state(limit: int = 8, city_id: Optional[str] = None) -> ZeroStateRespon
         popular_entities=popular_entities,
     )
 
+
+
+
+@search.get("/suggest", response_model=SuggestResponse)
+def suggest(q: str, limit: int = 20, city_id: Optional[str] = None):
+    """Autocomplete suggestions (ES-backed).
+
+    FE uses this on /disambiguate and for inline suggestions.
+    """
+    q = (q or "").strip()
+    if not q:
+        return SuggestResponse(items=[])
+
+    # clamp to avoid abuse
+    limit = max(1, min(int(limit or 20), 50))
+
+    hits, _ = es_search_entities(q=q, limit=limit, city_id=city_id, entity_types=None)
+    items = [hit_to_entity(h) for h in (hits or [])]
+    return SuggestResponse(items=items)
 
 @search.get("/resolve", response_model=ResolveResponse)
 def resolve(
