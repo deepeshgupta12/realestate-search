@@ -334,4 +334,4 @@ V1 focuses on **better intent + better constraint routing**:
 ---
 
 ## License / Usage 📄
-Internal prototype / local development. Extend as needed.
+MIT © 2025 Deepesh Kumar Gupta. See [LICENSE](LICENSE) for details. Internal prototype intended for local development.
